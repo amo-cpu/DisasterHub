@@ -1216,7 +1216,10 @@ if alerts:
     for alert in alerts[:3]:
         sev = alert.get("severity","").lower()
         msg = f"**Active {alert['event']}** — {alert['areas'][:120]}"
-        st.error(msg) if sev in ("extreme","severe") else st.warning(msg)
+        if sev in ("extreme","severe"):
+            st.error(msg)
+        else:
+            st.warning(msg)
 
 # Metrics
 c1,c2,c3,c4 = st.columns(4)
@@ -1473,8 +1476,7 @@ with tab2:
         top100.style.format({"Population":"{:,.0f}","RiskWeight":"{:,.0f}",
                              "FloodRisk":"{:.3f}","TornadoRisk":"{:.3f}","WildfireRisk":"{:.3f}",
                              "EarthquakeRisk":"{:.3f}","WinterRisk":"{:.3f}",
-                             "DistanceMiles":"{:.1f}","TravelMinutes":"{:.0f}"})
-        .background_gradient(subset=["RiskWeight"], cmap="Reds"),
+                             "DistanceMiles":"{:.1f}","TravelMinutes":"{:.0f}"}),
         use_container_width=True)
     st.download_button("Download High-Risk Communities Report", top100.to_csv(index=False),
                        "high_risk_communities.csv","text/csv")

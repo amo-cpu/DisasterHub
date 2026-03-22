@@ -1,22 +1,22 @@
 """
 DisasterHub — All-in-One Emergency Response Optimizer
 ======================================================
-Single file. Drop this into Replit and hit Run.
-On first launch it auto-downloads official data from:
+Single file. Works on Streamlit Cloud, Replit, or locally.
+Auto-downloads official data from:
   • FEMA National Risk Index
   • US Census 2020 Decennial
   • NOAA Storm Events 2018-2023
   • NOAA Weather API (live alerts)
 
-Requires:  streamlit, pandas, numpy, scikit-learn,
-           folium, streamlit-folium, reportlab, requests
+Requires: streamlit, pandas, numpy, scikit-learn,
+          folium, streamlit-folium, reportlab, requests
 """
 
-# ── IMPORTS ───────────────────────────────────────────────────
+# ── IMPORTS (single block — no duplicates) ────────────────────
 import streamlit as st
 import pandas as pd
 import numpy as np
-import os, io, requests, zipfile, gzip, warnings
+import os, io, requests, zipfile, gzip, warnings, json
 from datetime import datetime
 from sklearn.cluster import KMeans
 import folium
@@ -27,1173 +27,20 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    HRFlowable, KeepTogether
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 )
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 
 warnings.filterwarnings("ignore")
 
-
-
-# ────────────────────────────────────────────────────────────
-# DATA LOADER — Official FEMA + Census + NOAA pipeline
-# ────────────────────────────────────────────────────────────
-warnings.filterwarnings("ignore")
+st.set_page_config(layout="wide", page_title="DisasterHub — Emergency Response Optimizer")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
-
 OUTPUT_CSV = os.path.join(DATA_DIR, "uszips.csv")
 
-
-# ──────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────
-def _download(url: str, desc: str, timeout: int = 60) -> bytes | None:
-    print(f"  Downloading {desc}...")
-    try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "DisasterHub/1.0"})
-        r.raise_for_status()
-        print(f"    OK  ({len(r.content)/1024:.0f} KB)")
-        return r.content
-    except Exception as e:
-        print(f"    FAILED: {e}")
-        return None
-
-
-def _normalize_0_1(series: pd.Series) -> pd.Series:
-    """Min-max normalize a series to [0, 1], handling NaN."""
-    mn, mx = series.min(), series.max()
-    if mx == mn:
-        return series.fillna(0) * 0
-    return ((series - mn) / (mx - mn)).fillna(0).clip(0, 1)
-
-
-# ──────────────────────────────────────────────────────────────
-# STEP 1 — FEMA NATIONAL RISK INDEX (county level)
-# ──────────────────────────────────────────────────────────────
-def load_fema_nri() -> pd.DataFrame:
-    """
-    Returns a DataFrame with columns:
-      STCOFIPS, FloodRisk, HurricaneRisk, CoastalRisk,
-      TornadoRisk, WildfireRisk, EarthquakeRisk, WinterRisk
-    one row per county.
-    """
-    cache = os.path.join(DATA_DIR, "fema_nri_counties.csv")
-    if os.path.exists(cache):
-        print("  Using cached FEMA NRI data.")
-        return pd.read_csv(cache, dtype={"STCOFIPS": str})
-
-    url = ("https://hazards.fema.gov/nri/Content/StaticDocuments/DataDownload/"
-           "NRI_Table_Counties/NRI_Table_Counties.zip")
-    raw = _download(url, "FEMA National Risk Index (counties)")
-    if raw is None:
-        return pd.DataFrame()
-
-    if raw[:4] != b"PK\x03\x04":
-        print("    Not a valid ZIP file — skipping FEMA NRI.")
-        return pd.DataFrame()
-
-    zf = zipfile.ZipFile(io.BytesIO(raw))
-    csv_name = next((n for n in zf.namelist() if n.lower().endswith(".csv")), None)
-    if csv_name is None:
-        print("    No CSV found in FEMA NRI ZIP.")
-        return pd.DataFrame()
-
-    with zf.open(csv_name) as fh:
-        nri = pd.read_csv(fh, dtype=str, low_memory=False)
-
-    print(f"    Loaded {len(nri):,} counties from FEMA NRI.")
-
-    # Standardise FIPS
-    nri["STCOFIPS"] = nri["STCOFIPS"].astype(str).str.zfill(5)
-
-    # The NRI risk fields are numeric scores (higher = higher risk)
-    risk_map = {
-        "FLDPB_RISKS":  "FloodRisk",
-        "HWAV_RISKS":   "HurricaneRisk",
-        "CFLD_RISKS":   "CoastalRisk",
-        "TRND_RISKS":   "TornadoRisk",
-        "WFIR_RISKS":   "WildfireRisk",
-        "ERQK_RISKS":   "EarthquakeRisk",
-        "WNTW_RISKS":   "WinterRisk",
-    }
-    # Also grab overall composite risk and expected annual loss
-    extra_map = {
-        "RISK_SCORE":   "OverallRisk",
-        "EAL_VALT":     "ExpectedAnnualLoss",
-    }
-
-    keep = ["STCOFIPS"] + list(risk_map.keys()) + [k for k in extra_map if k in nri.columns]
-    nri  = nri[[c for c in keep if c in nri.columns]].copy()
-    nri  = nri.rename(columns={**risk_map, **extra_map})
-
-    for col in list(risk_map.values()) + ["OverallRisk"]:
-        if col in nri.columns:
-            nri[col] = pd.to_numeric(nri[col], errors="coerce")
-            nri[col] = _normalize_0_1(nri[col])
-        else:
-            nri[col] = np.nan
-
-    if "ExpectedAnnualLoss" in nri.columns:
-        nri["ExpectedAnnualLoss"] = pd.to_numeric(nri["ExpectedAnnualLoss"], errors="coerce").fillna(0)
-    else:
-        nri["ExpectedAnnualLoss"] = 0
-
-    # Fill missing risk fields with 0
-    for col in list(risk_map.values()):
-        if col not in nri.columns:
-            nri[col] = 0.0
-        nri[col] = nri[col].fillna(0.0)
-
-    nri.to_csv(cache, index=False)
-    print(f"    Saved FEMA NRI cache ({len(nri):,} counties).")
-    return nri
-
-
-# ──────────────────────────────────────────────────────────────
-# STEP 2 — CENSUS ZCTA ↔ COUNTY CROSSWALK
-# ──────────────────────────────────────────────────────────────
-def load_zcta_county_crosswalk() -> pd.DataFrame:
-    """
-    Returns DataFrame with columns: ZCTA5, STCOFIPS
-    (one row per ZIP–county pair; ZIPs spanning multiple counties
-    are listed multiple times — we keep the dominant county by land area).
-    """
-    cache = os.path.join(DATA_DIR, "zcta_county_xwalk.csv")
-    if os.path.exists(cache):
-        print("  Using cached ZCTA–county crosswalk.")
-        return pd.read_csv(cache, dtype=str)
-
-    url = ("https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/"
-           "tab20_zcta520_county20_natl.txt")
-    raw = _download(url, "Census ZCTA–county crosswalk")
-    if raw is None:
-        return pd.DataFrame()
-
-    xw = pd.read_csv(io.BytesIO(raw), sep="|", dtype=str, low_memory=False)
-    xw.columns = [c.strip().upper() for c in xw.columns]
-
-    # Expected columns: GEOID_ZCTA5_20, GEOID_COUNTY_20, AREALAND_PART
-    zcta_col   = next((c for c in xw.columns if "ZCTA" in c and "GEOID" in c), None)
-    county_col = next((c for c in xw.columns if "COUNTY" in c and "GEOID" in c), None)
-    area_col   = next((c for c in xw.columns if "AREALAND" in c), None)
-
-    if not zcta_col or not county_col:
-        print("    Unexpected crosswalk column names:", xw.columns.tolist())
-        return pd.DataFrame()
-
-    xw = xw.rename(columns={zcta_col: "ZCTA5", county_col: "STCOFIPS"})
-    xw["ZCTA5"]     = xw["ZCTA5"].astype(str).str.zfill(5)
-    xw["STCOFIPS"]  = xw["STCOFIPS"].astype(str).str.zfill(5)
-
-    if area_col:
-        xw[area_col] = pd.to_numeric(xw[area_col], errors="coerce").fillna(0)
-        # Keep the county with the largest land overlap per ZIP
-        xw = (xw.sort_values(area_col, ascending=False)
-                 .drop_duplicates(subset=["ZCTA5"], keep="first")
-                 [["ZCTA5","STCOFIPS"]])
-    else:
-        xw = xw[["ZCTA5","STCOFIPS"]].drop_duplicates(subset=["ZCTA5"])
-
-    xw.to_csv(cache, index=False)
-    print(f"    Saved ZCTA–county crosswalk ({len(xw):,} ZIPs).")
-    return xw
-
-
-# ──────────────────────────────────────────────────────────────
-# STEP 3 — CENSUS ZCTA GAZETTEER (ZIP centroids)
-# ──────────────────────────────────────────────────────────────
-def load_zcta_gazetteer() -> pd.DataFrame:
-    """
-    Returns DataFrame with columns: ZIP, Latitude, Longitude, ALAND
-    """
-    cache = os.path.join(DATA_DIR, "zcta_gazetteer.csv")
-    if os.path.exists(cache):
-        print("  Using cached ZCTA gazetteer.")
-        return pd.read_csv(cache, dtype={"ZIP": str})
-
-    for url in [
-        "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2023_Gazetteer/2023_Gaz_zcta_national.zip",
-        "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2022_Gazetteer/2022_Gaz_zcta_national.zip",
-    ]:
-        raw = _download(url, "Census ZCTA Gazetteer")
-        if raw is None or raw[:4] != b"PK\x03\x04":
-            continue
-        zf      = zipfile.ZipFile(io.BytesIO(raw))
-        txt     = next((n for n in zf.namelist() if n.lower().endswith(".txt")), None)
-        if not txt:
-            continue
-        with zf.open(txt) as fh:
-            gaz = pd.read_csv(fh, sep="\t", dtype=str)
-        gaz.columns = [c.strip().upper() for c in gaz.columns]
-        gaz = gaz.rename(columns={"GEOID":"ZIP","INTPTLAT":"Latitude",
-                                   "INTPTLONG":"Longitude","ALAND":"ALAND"})
-        gaz["ZIP"]       = gaz["ZIP"].astype(str).str.zfill(5)
-        gaz["Latitude"]  = pd.to_numeric(gaz["Latitude"],  errors="coerce")
-        gaz["Longitude"] = pd.to_numeric(gaz["Longitude"], errors="coerce")
-        gaz = gaz.dropna(subset=["Latitude","Longitude"])
-        gaz = gaz[gaz["Latitude"].between(17,72) & gaz["Longitude"].between(-180,-60)]
-        out = gaz[["ZIP","Latitude","Longitude"]].copy()
-        if "ALAND" in gaz.columns:
-            out["ALAND"] = pd.to_numeric(gaz["ALAND"], errors="coerce").fillna(0)
-        out.to_csv(cache, index=False)
-        print(f"    Saved ZCTA gazetteer ({len(out):,} ZIPs).")
-        return out
-
-    return pd.DataFrame()
-
-
-# ──────────────────────────────────────────────────────────────
-# STEP 4 — CENSUS POPULATION VIA DECENNIAL API
-# ──────────────────────────────────────────────────────────────
-def load_census_population() -> pd.DataFrame:
-    """
-    Returns DataFrame with columns: ZIP, Population
-    Uses Census 2020 Decennial PL (no API key needed for basic totals).
-    """
-    cache = os.path.join(DATA_DIR, "census_population.csv")
-    if os.path.exists(cache):
-        print("  Using cached Census population data.")
-        return pd.read_csv(cache, dtype={"ZIP": str})
-
-    url = ("https://api.census.gov/data/2020/dec/pl"
-           "?get=P1_001N&for=zip%20code%20tabulation%20area:*")
-    raw = _download(url, "Census 2020 Decennial population by ZCTA", timeout=120)
-    if raw is None:
-        return pd.DataFrame()
-
-    try:
-        import json
-        data = json.loads(raw)
-        df = pd.DataFrame(data[1:], columns=data[0])
-        df = df.rename(columns={
-            "P1_001N": "Population",
-            "zip code tabulation area": "ZIP",
-        })
-        df["ZIP"]        = df["ZIP"].astype(str).str.zfill(5)
-        df["Population"] = pd.to_numeric(df["Population"], errors="coerce").fillna(0).astype(int)
-        df = df[["ZIP","Population"]]
-        df.to_csv(cache, index=False)
-        print(f"    Saved Census population ({len(df):,} ZIPs).")
-        return df
-    except Exception as e:
-        print(f"    Census API parse failed: {e}")
-        return pd.DataFrame()
-
-
-# ──────────────────────────────────────────────────────────────
-# STEP 5 — NOAA STORM EVENTS (historical damage)
-# ──────────────────────────────────────────────────────────────
-def load_noaa_storm_damage() -> pd.DataFrame:
-    """
-    Returns DataFrame with columns: STCOFIPS, HistoricalDamage
-    Aggregates property + crop damage from 2018–2023 NOAA Storm Events.
-    """
-    cache = os.path.join(DATA_DIR, "noaa_damage.csv")
-    if os.path.exists(cache):
-        print("  Using cached NOAA storm damage data.")
-        return pd.read_csv(cache, dtype={"STCOFIPS": str})
-
-    base = "https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/"
-    years = [2023, 2022, 2021, 2020, 2019, 2018]
-    all_dfs = []
-
-    for year in years:
-        # Try to find the right filename (NOAA filenames include creation date)
-        index_url = base
-        r = _download(index_url + f"StormEvents_details-ftp_v1.0_d{year}_c{year+1}0101.csv.gz",
-                      f"NOAA Storm Events {year}")
-        if r is None:
-            # Try alternate filenames
-            for suffix in ["0901", "0601", "0301"]:
-                r = _download(
-                    base + f"StormEvents_details-ftp_v1.0_d{year}_c{year}{suffix}.csv.gz",
-                    f"NOAA Storm Events {year} (alt)")
-                if r: break
-        if r is None:
-            continue
-        try:
-            with gzip.open(io.BytesIO(r)) as gz:
-                df = pd.read_csv(gz, dtype=str, low_memory=False,
-                                 usecols=["STATE_FIPS","CZ_FIPS","DAMAGE_PROPERTY","DAMAGE_CROPS"])
-            all_dfs.append(df)
-            print(f"    Loaded NOAA {year}: {len(df):,} events")
-        except Exception as e:
-            print(f"    NOAA {year} parse error: {e}")
-
-    if not all_dfs:
-        print("    No NOAA data loaded — skipping.")
-        return pd.DataFrame()
-
-    df = pd.concat(all_dfs, ignore_index=True)
-
-    def _parse_damage(s):
-        """Parse NOAA damage strings like '1.5M', '200K', '0' to float."""
-        if pd.isna(s) or str(s).strip() in ("0",""):
-            return 0.0
-        s = str(s).strip().upper().replace(",","")
-        try:
-            if s.endswith("K"): return float(s[:-1]) * 1_000
-            if s.endswith("M"): return float(s[:-1]) * 1_000_000
-            if s.endswith("B"): return float(s[:-1]) * 1_000_000_000
-            return float(s)
-        except Exception:
-            return 0.0
-
-    df["dmg"] = df["DAMAGE_PROPERTY"].apply(_parse_damage) + df["DAMAGE_CROPS"].apply(_parse_damage)
-    df["STATE_FIPS"] = df["STATE_FIPS"].astype(str).str.zfill(2)
-    df["CZ_FIPS"]    = df["CZ_FIPS"].astype(str).str.zfill(3)
-    df["STCOFIPS"]   = df["STATE_FIPS"] + df["CZ_FIPS"]
-
-    result = (df.groupby("STCOFIPS")["dmg"].sum()
-                .reset_index().rename(columns={"dmg":"HistoricalDamage"}))
-    result.to_csv(cache, index=False)
-    print(f"    Saved NOAA damage ({len(result):,} counties).")
-    return result
-
-
-# ──────────────────────────────────────────────────────────────
-# STEP 6 — ZIP → CITY / STATE  (from Census place names)
-# ──────────────────────────────────────────────────────────────
-def load_zcta_place_names() -> pd.DataFrame:
-    """
-    Returns DataFrame with columns: ZIP, City, State
-    Uses the Census ZCTA-to-Place relationship file.
-    """
-    cache = os.path.join(DATA_DIR, "zcta_names.csv")
-    if os.path.exists(cache):
-        print("  Using cached ZCTA place names.")
-        return pd.read_csv(cache, dtype=str)
-
-    url = ("https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/"
-           "tab20_zcta520_place20_natl.txt")
-    raw = _download(url, "Census ZCTA–place name file")
-    if raw is None:
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(io.BytesIO(raw), sep="|", dtype=str, low_memory=False)
-        df.columns = [c.strip().upper() for c in df.columns]
-
-        zcta_col  = next((c for c in df.columns if "ZCTA" in c and "GEOID" in c), None)
-        place_col = next((c for c in df.columns if "NAMELSAD" in c or "NAME" in c and "PLACE" in c), None)
-        state_col = next((c for c in df.columns if "STATE" in c and ("FIPS" in c or "ABBR" in c or "NS" in c)), None)
-        area_col  = next((c for c in df.columns if "AREALAND" in c), None)
-
-        if not zcta_col:
-            return pd.DataFrame()
-
-        df = df.rename(columns={
-            zcta_col:  "ZIP",
-            place_col: "City",
-            state_col: "State",
-        } if place_col and state_col else {zcta_col: "ZIP"})
-
-        df["ZIP"] = df["ZIP"].astype(str).str.zfill(5)
-
-        if area_col:
-            df[area_col] = pd.to_numeric(df[area_col], errors="coerce").fillna(0)
-            df = (df.sort_values(area_col, ascending=False)
-                    .drop_duplicates(subset=["ZIP"], keep="first"))
-
-        # Clean city names — remove " city", " town", " CDP" suffixes
-        if "City" in df.columns:
-            df["City"] = (df["City"].astype(str)
-                          .str.replace(r"\s+(city|town|village|CDP|borough|municipality)$",
-                                       "", regex=True, case=False)
-                          .str.strip())
-        if "State" in df.columns:
-            # Convert FIPS to abbreviation if needed
-            FIPS_TO_ABBR = {
-                "01":"AL","02":"AK","04":"AZ","05":"AR","06":"CA","08":"CO","09":"CT",
-                "10":"DE","11":"DC","12":"FL","13":"GA","15":"HI","16":"ID","17":"IL",
-                "18":"IN","19":"IA","20":"KS","21":"KY","22":"LA","23":"ME","24":"MD",
-                "25":"MA","26":"MI","27":"MN","28":"MS","29":"MO","30":"MT","31":"NE",
-                "32":"NV","33":"NH","34":"NJ","35":"NM","36":"NY","37":"NC","38":"ND",
-                "39":"OH","40":"OK","41":"OR","42":"PA","44":"RI","45":"SC","46":"SD",
-                "47":"TN","48":"TX","49":"UT","50":"VT","51":"VA","53":"WA","54":"WV",
-                "55":"WI","56":"WY","72":"PR","78":"VI",
-            }
-            df["State"] = df["State"].astype(str).str[:2].map(
-                lambda x: FIPS_TO_ABBR.get(x, x))
-
-        out_cols = ["ZIP"] + ([c for c in ["City","State"] if c in df.columns])
-        out = df[out_cols].drop_duplicates(subset=["ZIP"])
-        out.to_csv(cache, index=False)
-        print(f"    Saved ZCTA place names ({len(out):,} ZIPs).")
-        return out
-    except Exception as e:
-        print(f"    Place name parse error: {e}")
-        return pd.DataFrame()
-
-
-# ──────────────────────────────────────────────────────────────
-# MASTER BUILD
-# ──────────────────────────────────────────────────────────────
-def build_official_dataset() -> pd.DataFrame:
-    """
-    Assembles all official datasets into one clean ZIP-level DataFrame.
-    Falls back gracefully if any source fails to download.
-    Writes to data/uszips.csv for app.py to consume.
-    """
-    print("\n" + "="*60)
-    print("DisasterHub — Official Data Pipeline")
-    print("="*60)
-
-    # 1. ZIP centroids (required)
-    print("\n[1/6] Census ZCTA Gazetteer (ZIP centroids)...")
-    gaz = load_zcta_gazetteer()
-    if gaz.empty:
-        print("FATAL: Cannot build dataset without ZIP centroids.")
-        return pd.DataFrame()
-    df = gaz.copy()
-    print(f"  Base: {len(df):,} ZIP codes with coordinates.")
-
-    # 2. Population
-    print("\n[2/6] Census 2020 population...")
-    pop = load_census_population()
-    if not pop.empty:
-        df = df.merge(pop, on="ZIP", how="left")
-        df["Population"] = df["Population"].fillna(0).astype(int)
-        print(f"  Matched population to {df['Population'].gt(0).sum():,} ZIPs.")
-    else:
-        print("  Using synthetic population estimates.")
-        np.random.seed(42)
-        df["Population"] = np.random.randint(1_000, 40_000, len(df))
-
-    # 3. Place names
-    print("\n[3/6] Census ZCTA place names...")
-    names = load_zcta_place_names()
-    if not names.empty:
-        df = df.merge(names, on="ZIP", how="left")
-        print(f"  Matched city names to {df['City'].notna().sum():,} ZIPs.")
-    else:
-        df["City"]  = ""
-        df["State"] = ""
-
-    # 4. FEMA NRI risk scores
-    print("\n[4/6] FEMA National Risk Index...")
-    nri = load_fema_nri()
-    xwalk = load_zcta_county_crosswalk()
-
-    if not nri.empty and not xwalk.empty:
-        zip_risk = xwalk.merge(nri, on="STCOFIPS", how="left")
-        zip_risk = zip_risk.rename(columns={"ZCTA5":"ZIP"})
-        df = df.merge(zip_risk.drop(columns=["STCOFIPS"], errors="ignore"),
-                      on="ZIP", how="left")
-        risk_fields = ["FloodRisk","HurricaneRisk","CoastalRisk",
-                       "TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
-        for col in risk_fields:
-            if col in df.columns:
-                df[col] = df[col].fillna(0.0)
-            else:
-                df[col] = 0.0
-        matched = df["FloodRisk"].gt(0).sum()
-        print(f"  Matched FEMA risk scores to {matched:,} ZIPs ({matched/len(df)*100:.0f}%).")
-        use_synthetic_risk = False
-    else:
-        print("  FEMA NRI unavailable — using geographic heuristics as fallback.")
-        use_synthetic_risk = True
-
-    # 5. NOAA damage
-    print("\n[5/6] NOAA Storm Events (historical damage)...")
-    noaa = load_noaa_storm_damage()
-    if not noaa.empty and not xwalk.empty:
-        zip_dmg = xwalk.merge(noaa, on="STCOFIPS", how="left")
-        zip_dmg = zip_dmg.rename(columns={"ZCTA5":"ZIP"})
-        df = df.merge(zip_dmg[["ZIP","HistoricalDamage"]], on="ZIP", how="left")
-        df["HistoricalDamage"] = df["HistoricalDamage"].fillna(0)
-        total_dmg = df["HistoricalDamage"].sum()
-        print(f"  Total historical damage matched: ${total_dmg:,.0f}")
-    else:
-        print("  NOAA damage unavailable — using estimates.")
-        np.random.seed(42)
-        df["HistoricalDamage"] = np.random.randint(5_000, 2_000_000, len(df))
-
-    # 6. Fill City / State from ZIP prefix table if still missing
-    print("\n[6/6] Filling missing city/state names...")
-    df = _fill_names(df)
-
-    # Synthetic risk fallback if FEMA wasn't available
-    if use_synthetic_risk:
-        df = _synthetic_risk(df)
-
-    # Final cleanup
-    df["ZIP"]        = df["ZIP"].astype(str).str.zfill(5)
-    df["Population"] = df["Population"].clip(lower=0).astype(int)
-    for col in ["FloodRisk","HurricaneRisk","CoastalRisk",
-                "TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]:
-        df[col] = df[col].clip(0, 1).round(4)
-    df["HistoricalDamage"] = df["HistoricalDamage"].clip(lower=0).round(0)
-
-    # Remove rows with no coordinates
-    df = df.dropna(subset=["Latitude","Longitude"])
-    df = df[df["Latitude"].between(17,72) & df["Longitude"].between(-180,-60)]
-    df = df.reset_index(drop=True)
-
-    df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n{'='*60}")
-    print(f"SUCCESS: {len(df):,} ZIP codes written to {OUTPUT_CSV}")
-    print(f"  Columns: {list(df.columns)}")
-    print(f"  FEMA risk source: {'Official FEMA NRI' if not use_synthetic_risk else 'Geographic heuristics (FEMA download failed)'}")
-    print(f"  Population source: {'Census 2020 Decennial' if not pop.empty else 'Synthetic estimates'}")
-    print(f"  Damage source: {'NOAA Storm Events 2018-2023' if not noaa.empty else 'Synthetic estimates'}")
-    print("="*60)
-    return df
-
-
-# ──────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────
-_ZIP3_STATE = {
-    "005":"NY","006":"PR","007":"PR","008":"VI","009":"PR",
-    "010":"MA","011":"MA","012":"MA","013":"MA","014":"MA","015":"MA","016":"MA","017":"MA","018":"MA","019":"MA",
-    "020":"MA","021":"MA","022":"MA","023":"MA","024":"MA","025":"MA","026":"MA","027":"MA",
-    "028":"RI","029":"RI","030":"NH","031":"NH","032":"NH","033":"NH","034":"NH","035":"NH","036":"NH","037":"NH","038":"NH",
-    "039":"ME","040":"ME","041":"ME","042":"ME","043":"ME","044":"ME","045":"ME","046":"ME","047":"ME","048":"ME","049":"ME",
-    "050":"VT","051":"VT","052":"VT","053":"VT","054":"VT","055":"VT","056":"VT","057":"VT","058":"VT","059":"VT",
-    "060":"CT","061":"CT","062":"CT","063":"CT","064":"CT","065":"CT","066":"CT","067":"CT","068":"CT","069":"CT",
-    "070":"NJ","071":"NJ","072":"NJ","073":"NJ","074":"NJ","075":"NJ","076":"NJ","077":"NJ","078":"NJ","079":"NJ",
-    "080":"NJ","081":"NJ","082":"NJ","083":"NJ","084":"NJ","085":"NJ","086":"NJ","087":"NJ","088":"NJ","089":"NJ",
-    "100":"NY","101":"NY","102":"NY","103":"NY","104":"NY","105":"NY","106":"NY","107":"NY","108":"NY","109":"NY",
-    "110":"NY","111":"NY","112":"NY","113":"NY","114":"NY","115":"NY","116":"NY","117":"NY","118":"NY","119":"NY",
-    "120":"NY","121":"NY","122":"NY","123":"NY","124":"NY","125":"NY","126":"NY","127":"NY","128":"NY","129":"NY",
-    "130":"NY","131":"NY","132":"NY","133":"NY","134":"NY","135":"NY","136":"NY","137":"NY","138":"NY","139":"NY",
-    "140":"NY","141":"NY","142":"NY","143":"NY","144":"NY","145":"NY","146":"NY","147":"NY","148":"NY","149":"NY",
-    "150":"PA","151":"PA","152":"PA","153":"PA","154":"PA","155":"PA","156":"PA","157":"PA","158":"PA","159":"PA",
-    "160":"PA","161":"PA","162":"PA","163":"PA","164":"PA","165":"PA","166":"PA","167":"PA","168":"PA","169":"PA",
-    "170":"PA","171":"PA","172":"PA","173":"PA","174":"PA","175":"PA","176":"PA","177":"PA","178":"PA","179":"PA",
-    "180":"PA","181":"PA","182":"PA","183":"PA","184":"PA","185":"PA","186":"PA","187":"PA","188":"PA","189":"PA",
-    "190":"PA","191":"PA","192":"PA","193":"PA","194":"PA","195":"PA","196":"PA",
-    "197":"DE","198":"DE","199":"DE","200":"DC","201":"VA","202":"DC","203":"DC","204":"DC","205":"DC",
-    "206":"MD","207":"MD","208":"MD","209":"MD","210":"MD","211":"MD","212":"MD","214":"MD","215":"MD",
-    "216":"MD","217":"MD","218":"MD","219":"MD",
-    "220":"VA","221":"VA","222":"VA","223":"VA","224":"VA","225":"VA","226":"VA","227":"VA","228":"VA","229":"VA",
-    "230":"VA","231":"VA","232":"VA","233":"VA","234":"VA","235":"VA","236":"VA","237":"VA","238":"VA","239":"VA",
-    "240":"VA","241":"VA","242":"VA","243":"VA","244":"VA","245":"VA","246":"VA",
-    "247":"WV","248":"WV","249":"WV","250":"WV","251":"WV","252":"WV","253":"WV","254":"WV","255":"WV",
-    "256":"WV","257":"WV","258":"WV","259":"WV","260":"WV","261":"WV","262":"WV","263":"WV","264":"WV",
-    "265":"WV","266":"WV","267":"WV","268":"WV",
-    "270":"NC","271":"NC","272":"NC","273":"NC","274":"NC","275":"NC","276":"NC","277":"NC","278":"NC","279":"NC",
-    "280":"NC","281":"NC","282":"NC","283":"NC","284":"NC","285":"NC","286":"NC","287":"NC","288":"NC","289":"NC",
-    "290":"SC","291":"SC","292":"SC","293":"SC","294":"SC","295":"SC","296":"SC","297":"SC","298":"SC","299":"SC",
-    "300":"GA","301":"GA","302":"GA","303":"GA","304":"GA","305":"GA","306":"GA","307":"GA","308":"GA","309":"GA",
-    "310":"GA","311":"GA","312":"GA","313":"GA","314":"GA","315":"GA","316":"GA","317":"GA","318":"GA","319":"GA",
-    "320":"FL","321":"FL","322":"FL","323":"FL","324":"FL","325":"FL","326":"FL","327":"FL","328":"FL","329":"FL",
-    "330":"FL","331":"FL","332":"FL","333":"FL","334":"FL","335":"FL","336":"FL","337":"FL","338":"FL","339":"FL",
-    "340":"HI","341":"FL","342":"FL","344":"FL","346":"FL","347":"FL","349":"FL",
-    "350":"AL","351":"AL","352":"AL","354":"AL","355":"AL","356":"AL","357":"AL","358":"AL","359":"AL",
-    "360":"AL","361":"AL","362":"AL","363":"AL","364":"AL","365":"AL","366":"AL","367":"AL","368":"AL","369":"AL",
-    "370":"TN","371":"TN","372":"TN","373":"TN","374":"TN","376":"TN","377":"TN","378":"TN","379":"TN",
-    "380":"TN","381":"TN","382":"TN","383":"TN","384":"TN","385":"TN",
-    "386":"MS","387":"MS","388":"MS","389":"MS","390":"MS","391":"MS","392":"MS","393":"MS","394":"MS","395":"MS","396":"MS",
-    "400":"KY","401":"KY","402":"KY","403":"KY","404":"KY","405":"KY","406":"KY","407":"KY","408":"KY","409":"KY",
-    "410":"KY","411":"KY","412":"KY","413":"KY","414":"KY","415":"KY","416":"KY","417":"KY","418":"KY",
-    "420":"KY","421":"KY","422":"KY","423":"KY","424":"KY","425":"KY","426":"KY","427":"KY",
-    "430":"OH","431":"OH","432":"OH","433":"OH","434":"OH","435":"OH","436":"OH","437":"OH","438":"OH","439":"OH",
-    "440":"OH","441":"OH","442":"OH","443":"OH","444":"OH","445":"OH","446":"OH","447":"OH","448":"OH","449":"OH",
-    "450":"OH","451":"OH","452":"OH","453":"OH","454":"OH","455":"OH","456":"OH","457":"OH","458":"OH",
-    "460":"IN","461":"IN","462":"IN","463":"IN","464":"IN","465":"IN","466":"IN","467":"IN","468":"IN","469":"IN",
-    "470":"IN","471":"IN","472":"IN","473":"IN","474":"IN","475":"IN","476":"IN","477":"IN","478":"IN","479":"IN",
-    "480":"MI","481":"MI","482":"MI","483":"MI","484":"MI","485":"MI","486":"MI","487":"MI","488":"MI","489":"MI",
-    "490":"MI","491":"MI","492":"MI","493":"MI","494":"MI","495":"MI","496":"MI","497":"MI","498":"MI","499":"MI",
-    "500":"IA","501":"IA","502":"IA","503":"IA","504":"IA","505":"IA","506":"IA","507":"IA","508":"IA",
-    "510":"IA","511":"IA","512":"IA","513":"IA","514":"IA","515":"IA","516":"IA","520":"IA","521":"IA","522":"IA",
-    "523":"IA","524":"IA","525":"IA","526":"IA","527":"IA","528":"IA",
-    "530":"WI","531":"WI","532":"WI","534":"WI","535":"WI","537":"WI","538":"WI","539":"WI","540":"WI","541":"WI",
-    "542":"WI","543":"WI","544":"WI","545":"WI","546":"WI","547":"WI","548":"WI","549":"WI",
-    "550":"MN","551":"MN","553":"MN","554":"MN","555":"MN","556":"MN","557":"MN","558":"MN","559":"MN",
-    "560":"MN","561":"MN","562":"MN","563":"MN","564":"MN","565":"MN","566":"MN","567":"MN",
-    "570":"SD","571":"SD","572":"SD","573":"SD","574":"SD","575":"SD","576":"SD","577":"SD",
-    "580":"ND","581":"ND","582":"ND","583":"ND","584":"ND","585":"ND","586":"ND","587":"ND","588":"ND",
-    "590":"MT","591":"MT","592":"MT","593":"MT","594":"MT","595":"MT","596":"MT","597":"MT","598":"MT","599":"MT",
-    "600":"IL","601":"IL","602":"IL","603":"IL","604":"IL","605":"IL","606":"IL","607":"IL","608":"IL","609":"IL",
-    "610":"IL","611":"IL","612":"IL","613":"IL","614":"IL","615":"IL","616":"IL","617":"IL","618":"IL","619":"IL",
-    "620":"IL","621":"IL","622":"IL","623":"IL","624":"IL","625":"IL","626":"IL","627":"IL","628":"IL","629":"IL",
-    "630":"MO","631":"MO","633":"MO","634":"MO","635":"MO","636":"MO","637":"MO","638":"MO","639":"MO",
-    "640":"MO","641":"MO","644":"MO","645":"MO","646":"MO","647":"MO","648":"MO","649":"MO",
-    "650":"MO","651":"MO","652":"MO","653":"MO","654":"MO","655":"MO","656":"MO","657":"MO","658":"MO",
-    "660":"KS","661":"KS","662":"KS","664":"KS","665":"KS","666":"KS","667":"KS","668":"KS","669":"KS",
-    "670":"KS","671":"KS","672":"KS","673":"KS","674":"KS","675":"KS","676":"KS","677":"KS","678":"KS","679":"KS",
-    "680":"NE","681":"NE","683":"NE","684":"NE","685":"NE","686":"NE","687":"NE","688":"NE","689":"NE",
-    "690":"NE","691":"NE","692":"NE","693":"NE",
-    "700":"LA","701":"LA","703":"LA","704":"LA","705":"LA","706":"LA","707":"LA","708":"LA",
-    "710":"LA","711":"LA","712":"LA","713":"LA","714":"LA",
-    "716":"AR","717":"AR","718":"AR","719":"AR","720":"AR","721":"AR","722":"AR","723":"AR","724":"AR",
-    "725":"AR","726":"AR","727":"AR","728":"AR","729":"AR",
-    "730":"OK","731":"OK","733":"OK","734":"OK","735":"OK","736":"OK","737":"OK","738":"OK","739":"OK",
-    "740":"OK","741":"OK","743":"OK","744":"OK","745":"OK","746":"OK","747":"OK","748":"OK","749":"OK",
-    "750":"TX","751":"TX","752":"TX","753":"TX","754":"TX","755":"TX","756":"TX","757":"TX","758":"TX","759":"TX",
-    "760":"TX","761":"TX","762":"TX","763":"TX","764":"TX","765":"TX","766":"TX","767":"TX","768":"TX","769":"TX",
-    "770":"TX","771":"TX","772":"TX","773":"TX","774":"TX","775":"TX","776":"TX","777":"TX","778":"TX","779":"TX",
-    "780":"TX","781":"TX","782":"TX","783":"TX","784":"TX","785":"TX","786":"TX","787":"TX","788":"TX","789":"TX",
-    "790":"TX","791":"TX","792":"TX","793":"TX","794":"TX","795":"TX","796":"TX","797":"TX","798":"TX","799":"TX",
-    "800":"CO","801":"CO","802":"CO","803":"CO","804":"CO","805":"CO","806":"CO","807":"CO","808":"CO","809":"CO",
-    "810":"CO","811":"CO","812":"CO","813":"CO","814":"CO","815":"CO","816":"CO",
-    "820":"WY","821":"WY","822":"WY","823":"WY","824":"WY","825":"WY","826":"WY","827":"WY","828":"WY",
-    "829":"WY","830":"WY","831":"WY","832":"ID","833":"ID","834":"ID","835":"ID","836":"ID","837":"ID","838":"ID",
-    "840":"UT","841":"UT","842":"UT","843":"UT","844":"UT","845":"UT","846":"UT","847":"UT",
-    "850":"AZ","851":"AZ","852":"AZ","853":"AZ","855":"AZ","856":"AZ","857":"AZ","859":"AZ",
-    "860":"AZ","863":"AZ","864":"AZ","865":"AZ",
-    "870":"NM","871":"NM","872":"NM","873":"NM","874":"NM","875":"NM","876":"NM","877":"NM","878":"NM",
-    "879":"NM","880":"NM","881":"NM","882":"NM","883":"NM","884":"NM","885":"TX",
-    "889":"NV","890":"NV","891":"NV","893":"NV","894":"NV","895":"NV","897":"NV","898":"NV",
-    "900":"CA","901":"CA","902":"CA","903":"CA","904":"CA","905":"CA","906":"CA","907":"CA","908":"CA",
-    "910":"CA","911":"CA","912":"CA","913":"CA","914":"CA","915":"CA","916":"CA","917":"CA","918":"CA","919":"CA",
-    "920":"CA","921":"CA","922":"CA","923":"CA","924":"CA","925":"CA","926":"CA","927":"CA","928":"CA",
-    "930":"CA","931":"CA","932":"CA","933":"CA","934":"CA","935":"CA","936":"CA","937":"CA","938":"CA","939":"CA",
-    "940":"CA","941":"CA","943":"CA","944":"CA","945":"CA","946":"CA","947":"CA","948":"CA","949":"CA",
-    "950":"CA","951":"CA","952":"CA","953":"CA","954":"CA","955":"CA","956":"CA","957":"CA","958":"CA","959":"CA",
-    "960":"CA","961":"CA","967":"HI","968":"HI",
-    "970":"OR","971":"OR","972":"OR","973":"OR","974":"OR","975":"OR","976":"OR","977":"OR","978":"OR","979":"OR",
-    "980":"WA","981":"WA","982":"WA","983":"WA","984":"WA","985":"WA","986":"WA","988":"WA","989":"WA",
-    "990":"WA","991":"WA","992":"WA","993":"WA","994":"WA",
-    "995":"AK","996":"AK","997":"AK","998":"AK","999":"AK",
-}
-
-_ZIP3_CITY = {
-    "020":"Boston","021":"Boston","030":"Manchester","040":"Portland","050":"Burlington",
-    "060":"Hartford","070":"Newark","080":"Trenton","100":"New York","110":"Queens",
-    "120":"Albany","130":"Syracuse","140":"Buffalo","150":"Pittsburgh","160":"Erie",
-    "170":"Harrisburg","180":"Allentown","190":"Philadelphia","197":"Wilmington",
-    "200":"Washington DC","206":"Rockville","210":"Baltimore","220":"Arlington",
-    "230":"Richmond","233":"Norfolk","240":"Roanoke","247":"Huntington","250":"Charleston",
-    "270":"Greensboro","275":"Raleigh","280":"Charlotte","284":"Wilmington",
-    "290":"Columbia","294":"Charleston","295":"Greenville",
-    "300":"Atlanta","308":"Augusta","310":"Macon","312":"Savannah",
-    "320":"Jacksonville","323":"Tallahassee","327":"Orlando","330":"Miami",
-    "333":"Fort Lauderdale","334":"West Palm Beach","335":"Tampa","339":"Fort Myers",
-    "350":"Birmingham","357":"Huntsville","360":"Montgomery","361":"Mobile",
-    "370":"Nashville","373":"Chattanooga","377":"Knoxville","380":"Memphis",
-    "386":"Greenville","390":"Jackson","393":"Biloxi","394":"Gulfport",
-    "400":"Louisville","403":"Lexington","420":"Paducah",
-    "430":"Columbus","434":"Toledo","440":"Cleveland","444":"Youngstown","446":"Akron",
-    "450":"Cincinnati","453":"Dayton","460":"Indianapolis","465":"South Bend",
-    "467":"Fort Wayne","480":"Detroit","483":"Ann Arbor","488":"Lansing","493":"Grand Rapids",
-    "500":"Des Moines","507":"Dubuque","520":"Davenport",
-    "530":"Milwaukee","537":"Madison","540":"Green Bay",
-    "550":"Minneapolis","551":"St Paul","556":"Duluth","559":"Rochester",
-    "570":"Sioux Falls","574":"Rapid City","580":"Fargo","583":"Minot","585":"Bismarck",
-    "590":"Billings","593":"Great Falls","595":"Helena","596":"Missoula",
-    "600":"Chicago","608":"Joliet","610":"Rockford","612":"Peoria",
-    "618":"Springfield","620":"East St Louis","630":"St Louis","640":"Kansas City",
-    "650":"Columbia","654":"Springfield","660":"Wichita","664":"Topeka",
-    "680":"Omaha","683":"Lincoln","690":"McCook",
-    "700":"New Orleans","705":"Lafayette","708":"Baton Rouge","710":"Shreveport",
-    "716":"Pine Bluff","720":"Little Rock","727":"Fayetteville",
-    "730":"Oklahoma City","740":"Tulsa","750":"Dallas","760":"Fort Worth",
-    "765":"Waco","770":"Houston","775":"Galveston","778":"Beaumont",
-    "780":"San Antonio","785":"McAllen","786":"Austin","790":"Amarillo",
-    "792":"Wichita Falls","795":"Lubbock","797":"Midland","798":"El Paso",
-    "800":"Denver","805":"Colorado Springs","808":"Pueblo","815":"Fort Collins",
-    "820":"Cheyenne","822":"Casper","832":"Boise","840":"Salt Lake City","844":"Ogden",
-    "850":"Phoenix","855":"Mesa","856":"Tucson","860":"Flagstaff",
-    "870":"Albuquerque","874":"Santa Fe","878":"Las Cruces",
-    "889":"Las Vegas","893":"Reno","897":"Carson City",
-    "900":"Los Angeles","905":"Long Beach","910":"Pasadena","919":"San Bernardino",
-    "920":"San Diego","925":"Riverside","926":"Anaheim","927":"Santa Ana",
-    "930":"Ventura","932":"Bakersfield","936":"Fresno","939":"Salinas",
-    "940":"San Francisco","943":"Palo Alto","944":"Oakland","950":"San Jose",
-    "954":"Santa Rosa","956":"Sacramento","960":"Redding","967":"Honolulu",
-    "970":"Portland","973":"Salem","975":"Medford","978":"Eugene",
-    "980":"Seattle","983":"Tacoma","985":"Olympia","988":"Yakima","990":"Spokane",
-    "993":"Kennewick","995":"Anchorage","996":"Fairbanks","997":"Juneau","999":"Nome",
-}
-
-
-def _fill_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Fill blank City/State from ZIP prefix tables."""
-    if "City" not in df.columns:  df["City"]  = ""
-    if "State" not in df.columns: df["State"] = ""
-    df["City"]  = df["City"].fillna("").astype(str)
-    df["State"] = df["State"].fillna("").astype(str)
-
-    mask_c = df["City"].isin(["","Unknown","unknown","nan"])
-    if mask_c.any():
-        df.loc[mask_c,"City"] = df.loc[mask_c,"ZIP"].apply(
-            lambda z: _ZIP3_CITY.get(str(z).zfill(5)[:3], ""))
-
-    mask_s = df["State"].isin(["","Unknown","unknown","nan"])
-    if mask_s.any():
-        df.loc[mask_s,"State"] = df.loc[mask_s,"ZIP"].apply(
-            lambda z: _ZIP3_STATE.get(str(z).zfill(5)[:3], ""))
-
-    # Final fallback: use state area name or ZIP itself
-    def _fb(row):
-        c = str(row["City"]).strip()
-        if c and c not in ("","nan"): return c
-        s = str(row.get("State","")).strip()
-        return (s+" area") if s and s != "nan" else row["ZIP"]
-    df["City"] = df.apply(_fb, axis=1)
-    return df
-
-
-def _synthetic_risk(df: pd.DataFrame) -> pd.DataFrame:
-    """Geographic heuristic risk scores — used only as fallback."""
-    np.random.seed(42)
-    n   = len(df)
-    lon = df["Longitude"].values
-    lat = df["Latitude"].values
-    noise = np.random.uniform(0, 0.15, n)
-
-    east   = np.clip(1-(lon+65)/20,   0,1)
-    gulf   = np.clip(1-(lat-25)/10,   0,1) * np.clip(1-(-lon-80)/20, 0,1)
-    west   = np.clip(1-(-lon-115)/15, 0,1)
-    inland = np.clip(np.sin(np.radians(lat-30))*0.4+0.1, 0,1)
-    df["FloodRisk"]     = np.clip(east*0.35+gulf*0.55+inland+noise, 0,1)
-    df["HurricaneRisk"] = np.clip(gulf*0.80+east*0.35+noise*0.5,   0,1)
-    df["CoastalRisk"]   = np.clip(east*0.50+gulf*0.60+west*0.45+noise*0.4, 0,1)
-
-    t_alley = np.clip(np.exp(-((lat-37)**2)/50)*np.exp(-((-lon-97)**2)/100), 0,1)
-    d_alley = np.clip(np.exp(-((lat-33)**2)/30)*np.exp(-((-lon-88)**2)/80),  0,1)
-    df["TornadoRisk"]  = np.clip(t_alley*0.9+d_alley*0.75+noise*0.3, 0,1)
-
-    ca_r    = np.clip(1-(-lon-114)/20, 0,1)*np.clip(1-(lat-32)/25, 0,1)
-    rockies = np.clip(np.exp(-((-lon-106)**2)/80)*np.exp(-((lat-40)**2)/80), 0,1)
-    sw      = np.clip(np.exp(-((-lon-111)**2)/60)*np.exp(-((lat-34)**2)/60), 0,1)
-    df["WildfireRisk"] = np.clip(ca_r*0.85+rockies*0.70+sw*0.65+noise*0.3, 0,1)
-
-    w_seis = np.clip(1-(-lon-115)/18, 0,1)*np.clip(1-abs(lat-38)/15, 0,1)
-    nm     = np.clip(np.exp(-((-lon-89)**2)/30)*np.exp(-((lat-36)**2)/20),  0,1)
-    ak     = np.clip(np.exp(-((lat-61)**2)/50), 0,1)
-    df["EarthquakeRisk"] = np.clip(w_seis*0.90+nm*0.65+ak*0.70+noise*0.2, 0,1)
-
-    north  = np.clip((lat-35)/20, 0,1)
-    plains = np.clip(np.exp(-((-lon-100)**2)/120)*np.exp(-((lat-42)**2)/100), 0,1)
-    apps   = np.clip(np.exp(-((-lon-80)**2)/40)*np.exp(-((lat-40)**2)/60),   0,1)
-    df["WinterRisk"] = np.clip(north*0.80+plains*0.60+apps*0.50+noise*0.3, 0,1)
-
-    return df
-
-
-# ──────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ──────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    df = build_official_dataset()
-    if not df.empty:
-        print(f"\nSample rows:")
-        print(df[["ZIP","City","State","Population",
-                  "FloodRisk","TornadoRisk","WildfireRisk",
-                  "EarthquakeRisk","WinterRisk"]].head(10).to_string(index=False))
-
-
-# ────────────────────────────────────────────────────────────
-# PDF REPORT GENERATOR — Community risk report builder
-# ────────────────────────────────────────────────────────────
-NAVY       = colors.HexColor("#0a1628")
-BLUE       = colors.HexColor("#1a4a8a")
-CYAN       = colors.HexColor("#00b4d8")
-LIGHT_BLUE = colors.HexColor("#e8f4fd")
-RED        = colors.HexColor("#d62828")
-ORANGE     = colors.HexColor("#f77f00")
-GREEN      = colors.HexColor("#2d6a4f")
-LIGHT_GRAY = colors.HexColor("#f5f7fa")
-MID_GRAY   = colors.HexColor("#6c757d")
-DARK_GRAY  = colors.HexColor("#2c3e50")
-WHITE      = colors.white
-
-
-def _risk_color(value: float):
-    """Return a color based on 0-1 risk score."""
-    if value >= 0.7:
-        return RED
-    elif value >= 0.4:
-        return ORANGE
-    return GREEN
-
-
-def _risk_label(value: float) -> str:
-    if value >= 0.7:
-        return "HIGH"
-    elif value >= 0.4:
-        return "MODERATE"
-    return "LOW"
-
-
-def _risk_bar_table(label: str, value: float, width: float = 4.0) -> Table:
-    """Returns a mini table with a label, filled bar, and score."""
-    filled    = max(1, int(value * 20))
-    empty     = 20 - filled
-    bar_color = _risk_color(value)
-    bar_cells = [[""] * filled + [""] * empty]
-    bar_widths = [width / 20 * inch] * 20
-
-    bar = Table(bar_cells, colWidths=bar_widths, rowHeights=[10])
-    bar_style = [("BACKGROUND", (0, 0), (filled - 1, 0), bar_color),
-                 ("BACKGROUND", (filled, 0), (-1, 0), colors.HexColor("#dde3ea")),
-                 ("TOPPADDING", (0, 0), (-1, -1), 0),
-                 ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                 ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                 ("RIGHTPADDING", (0, 0), (-1, -1), 0)]
-    bar.setStyle(TableStyle(bar_style))
-
-    outer = Table(
-        [[Paragraph(f"<b>{label}</b>", ParagraphStyle("bl", fontSize=9, textColor=DARK_GRAY)),
-          bar,
-          Paragraph(f"<font color='#{bar_color.hexval()[2:]}' size='9'><b>{_risk_label(value)}</b> {value:.2f}</font>",
-                    ParagraphStyle("sc", fontSize=9, alignment=TA_RIGHT))]],
-        colWidths=[1.6*inch, width*inch, 1.0*inch],
-        rowHeights=[16],
-    )
-    outer.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    return outer
-
-
-def build_community_report(row, coverage_df, hub_city_labels_df) -> bytes:
-    """
-    Build a PDF community risk report for a single ZIP/row.
-
-    Parameters
-    ----------
-    row               : pd.Series  — one row from the main df (post-assignment)
-    coverage_df       : pd.DataFrame — the coverage table (with HubCity/HubState)
-    hub_city_labels_df: pd.DataFrame — hub_city_labels
-
-    Returns
-    -------
-    bytes — raw PDF content ready for st.download_button
-    """
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=letter,
-        leftMargin=0.75*inch,
-        rightMargin=0.75*inch,
-        topMargin=0.75*inch,
-        bottomMargin=0.75*inch,
-    )
-
-    styles = getSampleStyleSheet()
-    story  = []
-
-    # ── Helper styles ───────────────────────────────────────────
-    title_style = ParagraphStyle(
-        "title", fontSize=22, textColor=WHITE,
-        fontName="Helvetica-Bold", alignment=TA_LEFT, leading=26,
-    )
-    subtitle_style = ParagraphStyle(
-        "subtitle", fontSize=11, textColor=colors.HexColor("#90caf9"),
-        fontName="Helvetica", alignment=TA_LEFT,
-    )
-    section_style = ParagraphStyle(
-        "section", fontSize=11, textColor=WHITE,
-        fontName="Helvetica-Bold", alignment=TA_LEFT,
-    )
-    body_style = ParagraphStyle(
-        "body", fontSize=9, textColor=DARK_GRAY,
-        fontName="Helvetica", leading=14,
-    )
-    small_style = ParagraphStyle(
-        "small", fontSize=8, textColor=MID_GRAY,
-        fontName="Helvetica", leading=12,
-    )
-    label_style = ParagraphStyle(
-        "label", fontSize=8, textColor=MID_GRAY,
-        fontName="Helvetica", alignment=TA_CENTER,
-    )
-    value_style = ParagraphStyle(
-        "value", fontSize=16, textColor=DARK_GRAY,
-        fontName="Helvetica-Bold", alignment=TA_CENTER,
-    )
-
-    # ── Extract values ──────────────────────────────────────────
-    city        = str(row.get("City", ""))
-    state       = str(row.get("State", ""))
-    zip_code    = str(row.get("ZIP", ""))
-    population  = int(row.get("Population", 0))
-    flood_risk  = float(row.get("FloodRisk", 0))
-    hurr_risk   = float(row.get("HurricaneRisk", 0))
-    coast_risk  = float(row.get("CoastalRisk", 0))
-    risk_weight = float(row.get("RiskWeight", 0))
-    hub_id      = int(row.get("NearestHub", 0))
-    dist_miles  = float(row.get("DistanceMiles", 0))
-    travel_min  = float(row.get("TravelMinutes", 0))
-    hist_damage = float(row.get("HistoricalDamage", 0))
-
-    # Hub info
-    cov_row   = coverage_df[coverage_df["HubID"] == hub_id]
-    hub_city  = str(cov_row["HubCity"].iloc[0])  if len(cov_row) else "Hub Area"
-    hub_state = str(cov_row["HubState"].iloc[0]) if len(cov_row) else ""
-    hub_pop   = int(cov_row["PopulationCovered"].iloc[0]) if len(cov_row) else 0
-    hub_zips  = int(cov_row["ZIPsCovered"].iloc[0])       if len(cov_row) else 0
-    hub_avg   = float(cov_row["AvgTravelMinutes"].iloc[0]) if len(cov_row) else 0
-
-    overall_risk = (flood_risk + hurr_risk + coast_risk) / 3.0
-    generated    = datetime.now().strftime("%B %d, %Y at %I:%M %p")
-
-    # ── HEADER BANNER ───────────────────────────────────────────
-    header_data = [[
-        Paragraph("HYDROHUB", ParagraphStyle("hh", fontSize=9, textColor=CYAN,
-                  fontName="Helvetica-Bold", alignment=TA_LEFT)),
-        Paragraph("COMMUNITY RISK REPORT", ParagraphStyle("cr", fontSize=9,
-                  textColor=colors.HexColor("#90caf9"), fontName="Helvetica",
-                  alignment=TA_RIGHT)),
-    ]]
-    header_table = Table(header_data, colWidths=[3.5*inch, 3.5*inch], rowHeights=[20])
-    header_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (0, 0), (0, -1), 8),
-        ("RIGHTPADDING", (-1, 0), (-1, -1), 8),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    story.append(header_table)
-    story.append(Spacer(1, 0.15*inch))
-
-    # ── TITLE BLOCK ─────────────────────────────────────────────
-    title_data = [[
-        Paragraph(f"{city}, {state}", title_style),
-        Paragraph(
-            f"Overall Risk<br/><font size='20' color='#{_risk_color(overall_risk).hexval()[2:]}'>"
-            f"{_risk_label(overall_risk)}</font>",
-            ParagraphStyle("or", fontSize=10, textColor=colors.HexColor("#90caf9"),
-                           fontName="Helvetica", alignment=TA_RIGHT, leading=22),
-        ),
-    ]]
-    title_table = Table(title_data, colWidths=[4.5*inch, 2.5*inch], rowHeights=[50])
-    title_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), BLUE),
-        ("TOPPADDING", (0, 0), (-1, -1), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
-        ("LEFTPADDING", (0, 0), (0, -1), 12),
-        ("RIGHTPADDING", (-1, 0), (-1, -1), 12),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ROUNDEDCORNERS", [6]),
-    ]))
-    story.append(title_table)
-
-    subtitle_data = [[
-        Paragraph(f"ZIP Code {zip_code}  ·  Population {population:,}  ·  "
-                  f"Historical damage ${hist_damage:,.0f}",
-                  ParagraphStyle("sub2", fontSize=9, textColor=MID_GRAY,
-                                 fontName="Helvetica")),
-        Paragraph(f"Generated {generated}", small_style),
-    ]]
-    sub_table = Table(subtitle_data, colWidths=[4.5*inch, 2.5*inch], rowHeights=[18])
-    sub_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), LIGHT_GRAY),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (0, 0), (0, -1), 12),
-        ("RIGHTPADDING", (-1, 0), (-1, -1), 12),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (-1, 0), (-1, -1), "RIGHT"),
-    ]))
-    story.append(sub_table)
-    story.append(Spacer(1, 0.2*inch))
-
-    # ── KEY METRICS ROW ─────────────────────────────────────────
-    def metric_cell(label, value, sub=""):
-        return [
-            [Paragraph(label, label_style)],
-            [Paragraph(value, value_style)],
-            [Paragraph(sub, ParagraphStyle("msub", fontSize=8, textColor=MID_GRAY,
-                                           alignment=TA_CENTER))],
-        ]
-
-    metrics_data = [[
-        Table(metric_cell("NEAREST HUB",   f"Hub {hub_id}", f"{hub_city}, {hub_state}"),
-              colWidths=[1.75*inch], rowHeights=[14, 22, 14]),
-        Table(metric_cell("DISTANCE",       f"{dist_miles:.1f} mi", "straight line"),
-              colWidths=[1.75*inch], rowHeights=[14, 22, 14]),
-        Table(metric_cell("RESPONSE TIME",  f"{travel_min:.0f} min", "estimated"),
-              colWidths=[1.75*inch], rowHeights=[14, 22, 14]),
-        Table(metric_cell("RISK SCORE",     f"{risk_weight:,.0f}", "weighted exposure"),
-              colWidths=[1.75*inch], rowHeights=[14, 22, 14]),
-    ]]
-    metrics_table = Table(metrics_data, colWidths=[1.75*inch]*4, rowHeights=[60])
-    metrics_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), LIGHT_BLUE),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LINEBEFORE", (1, 0), (-1, -1), 0.5, colors.HexColor("#c5d8ed")),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#c5d8ed")),
-    ]))
-    story.append(metrics_table)
-    story.append(Spacer(1, 0.25*inch))
-
-    # ── RISK ASSESSMENT SECTION ──────────────────────────────────
-    section_banner = Table(
-        [[Paragraph("HAZARD RISK ASSESSMENT", section_style)]],
-        colWidths=[7.0*inch], rowHeights=[24],
-    )
-    section_banner.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-    ]))
-    story.append(section_banner)
-    story.append(Spacer(1, 0.1*inch))
-
-    risk_container = Table(
-        [[_risk_bar_table("Flood Risk",         flood_risk,  4.0)],
-         [_risk_bar_table("Hurricane Risk",      hurr_risk,   4.0)],
-         [_risk_bar_table("Coastal Storm Risk",  coast_risk,  4.0)]],
-        colWidths=[7.0*inch],
-    )
-    risk_container.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), LIGHT_GRAY),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("LEFTPADDING", (0, 0), (-1, -1), 12),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
-        ("LINEBELOW", (0, 0), (-1, -2), 0.5, colors.HexColor("#dde3ea")),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#c5d8ed")),
-    ]))
-    story.append(risk_container)
-    story.append(Spacer(1, 0.25*inch))
-
-    # ── NEAREST HUB DETAILS ──────────────────────────────────────
-    hub_banner = Table(
-        [[Paragraph("NEAREST EMERGENCY HUB", section_style)]],
-        colWidths=[7.0*inch], rowHeights=[24],
-    )
-    hub_banner.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-    ]))
-    story.append(hub_banner)
-    story.append(Spacer(1, 0.1*inch))
-
-    hub_details = [
-        ["Hub ID",          f"Hub {hub_id}"],
-        ["Nearest City",    f"{hub_city}, {hub_state}"],
-        ["Distance",        f"{dist_miles:.1f} miles"],
-        ["Est. Travel Time",f"{travel_min:.0f} minutes"],
-        ["Population Served", f"{hub_pop:,} people"],
-        ["ZIPs Covered",    f"{hub_zips} ZIP codes"],
-        ["Avg Travel Time (hub-wide)", f"{hub_avg:.0f} minutes"],
-    ]
-    hub_table = Table(
-        [[Paragraph(k, ParagraphStyle("k", fontSize=9, fontName="Helvetica-Bold",
-                                       textColor=DARK_GRAY)),
-          Paragraph(v, ParagraphStyle("v", fontSize=9, fontName="Helvetica",
-                                       textColor=BLUE))]
-         for k, v in hub_details],
-        colWidths=[2.8*inch, 4.2*inch],
-    )
-    hub_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), WHITE),
-        ("BACKGROUND", (0, 0), (-1, 0), LIGHT_BLUE),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("LINEBELOW", (0, 0), (-1, -2), 0.5, colors.HexColor("#dde3ea")),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#c5d8ed")),
-        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [WHITE, LIGHT_GRAY]),
-    ]))
-    story.append(hub_table)
-    story.append(Spacer(1, 0.25*inch))
-
-    # ── RECOMMENDATIONS ──────────────────────────────────────────
-    rec_banner = Table(
-        [[Paragraph("EMERGENCY PREPAREDNESS RECOMMENDATIONS", section_style)]],
-        colWidths=[7.0*inch], rowHeights=[24],
-    )
-    rec_banner.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-    ]))
-    story.append(rec_banner)
-    story.append(Spacer(1, 0.1*inch))
-
-    recs = []
-    if flood_risk >= 0.7:
-        recs.append("HIGH flood risk detected. This community should be prioritized for emergency hub placement. Recommended: pre-position flood response equipment within 30 miles.")
-    if hurr_risk >= 0.7:
-        recs.append("HIGH hurricane risk. Evacuation route planning and shelter-in-place protocols should be established and communicated to residents.")
-    if coast_risk >= 0.7:
-        recs.append("HIGH coastal storm risk. Storm surge contingency plans and coastal barrier assessments are strongly recommended.")
-    if travel_min > 90:
-        recs.append(f"Response time of {travel_min:.0f} minutes exceeds the 90-minute critical threshold. Consider deploying an additional hub closer to this community.")
-    if travel_min <= 60:
-        recs.append(f"Response time of {travel_min:.0f} minutes meets the 60-minute target. Current hub placement is effective for this community.")
-    if overall_risk >= 0.6 and travel_min > 60:
-        recs.append("Combined high risk and moderate response time — this ZIP code should be flagged for priority review in the next hub deployment cycle.")
-    if not recs:
-        recs.append("No critical risk thresholds exceeded. Continue monitoring and maintain current hub coverage.")
-
-    rec_data = [[Paragraph(f"• {r}", body_style)] for r in recs]
-    rec_table = Table(rec_data, colWidths=[7.0*inch])
-    rec_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), LIGHT_GRAY),
-        ("TOPPADDING", (0, 0), (-1, -1), 7),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-        ("LEFTPADDING", (0, 0), (-1, -1), 14),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
-        ("LINEBELOW", (0, 0), (-1, -2), 0.5, colors.HexColor("#dde3ea")),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#c5d8ed")),
-    ]))
-    story.append(rec_table)
-    story.append(Spacer(1, 0.3*inch))
-
-    # ── FOOTER ───────────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#c5d8ed")))
-    story.append(Spacer(1, 0.06*inch))
-    footer_data = [[
-        Paragraph(
-            "HydroHub Emergency Response Optimizer  ·  "
-            "Data: FEMA National Risk Index, US Census, NOAA Storm Events  ·  "
-            "This report is for planning purposes only.",
-            ParagraphStyle("foot", fontSize=7, textColor=MID_GRAY, fontName="Helvetica"),
-        ),
-        Paragraph(
-            f"Generated {generated}",
-            ParagraphStyle("footr", fontSize=7, textColor=MID_GRAY,
-                           fontName="Helvetica", alignment=TA_RIGHT),
-        ),
-    ]]
-    footer_table = Table(footer_data, colWidths=[5.0*inch, 2.0*inch])
-    footer_table.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    story.append(footer_table)
-
-    doc.build(story)
-    return buf.getvalue()
-
-
-# ────────────────────────────────────────────────────────────
-# STREAMLIT APP
-# ────────────────────────────────────────────────────────────
-import streamlit as st
-import pandas as pd
-import numpy as np
-import os, requests, zipfile, io
-from sklearn.cluster import KMeans
-import folium
-from folium.plugins import MarkerCluster, HeatMap
-from streamlit_folium import st_folium
-
-st.set_page_config(layout="wide", page_title="DisasterHub — Emergency Response Optimizer")
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-
 try:
-    ORS_API_KEY = st.secrets["ORS_API_KEY"]
+    ORS_API_KEY = st.secrets.get("ORS_API_KEY", None)
 except Exception:
     ORS_API_KEY = None
 
@@ -1211,7 +58,7 @@ DISASTER_TYPES = {
 }
 
 # ──────────────────────────────────────────────────────────────
-# ZIP-PREFIX LOOKUPS
+# ZIP PREFIX LOOKUPS
 # ──────────────────────────────────────────────────────────────
 ZIP3_STATE = {
     "005":"NY","006":"PR","007":"PR","008":"VI","009":"PR",
@@ -1526,105 +373,346 @@ def city_from_zip(z):
 def state_from_zip(z):
     return ZIP3_STATE.get(str(z).zfill(5)[:3], "")
 
-
+# ──────────────────────────────────────────────────────────────
+# HAVERSINE
+# ──────────────────────────────────────────────────────────────
 def haversine_matrix(lat1, lon1, lat2, lon2):
-    R  = 3958.8
+    R = 3958.8
     p1 = np.radians(lat1)[:, None]; p2 = np.radians(lat2)[None, :]
     l1 = np.radians(lon1)[:, None]; l2 = np.radians(lon2)[None, :]
     a  = np.sin((p2-p1)/2)**2 + np.cos(p1)*np.cos(p2)*np.sin((l2-l1)/2)**2
     return 2 * R * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_noaa_alerts():
+# ──────────────────────────────────────────────────────────────
+# OFFICIAL DATA PIPELINE HELPERS
+# ──────────────────────────────────────────────────────────────
+def _dl(url, desc, timeout=60):
     try:
-        r = requests.get(
-            "https://api.weather.gov/alerts/active",
-            params={"event": "Flood Watch,Flood Warning,Hurricane Watch,Hurricane Warning,"
-                             "Flash Flood Warning,Tornado Watch,Tornado Warning,"
-                             "Winter Storm Warning,Winter Storm Watch,Red Flag Warning,Fire Weather Watch"},
-            headers={"User-Agent": "DisasterHub/1.0"}, timeout=8,
-        )
-        if r.status_code == 200:
-            alerts = []
-            for f in r.json().get("features", [])[:5]:
-                p = f.get("properties", {})
-                alerts.append({"event": p.get("event","Alert"),
-                                "areas": p.get("areaDesc",""),
-                                "severity": p.get("severity","Unknown")})
-            return alerts
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "DisasterHub/1.0"})
+        r.raise_for_status()
+        return r.content
     except Exception:
-        pass
-    return []
+        return None
 
+def _norm01(s):
+    mn, mx = s.min(), s.max()
+    if mx == mn: return s.fillna(0)*0
+    return ((s-mn)/(mx-mn)).fillna(0).clip(0,1)
 
-@st.cache_data(show_spinner="Loading official government datasets…")
-def build_datasets():
-    """
-    Data priority order:
-    1. data/uszips.csv built by data_loader.py (official FEMA NRI + Census + NOAA)
-    2. Run data_loader.py automatically if file not cached yet
-    3. Census ZCTA Gazetteer direct download (coordinates only)
-    4. Built-in synthetic dataset (always works, no internet needed)
-    """
-    zip_csv = os.path.join(DATA_DIR, "uszips.csv")
+def _load_fema_nri():
+    cache = os.path.join(DATA_DIR, "fema_nri.csv")
+    if os.path.exists(cache):
+        return pd.read_csv(cache, dtype={"STCOFIPS":str})
+    raw = _dl("https://hazards.fema.gov/nri/Content/StaticDocuments/DataDownload/NRI_Table_Counties/NRI_Table_Counties.zip", "FEMA NRI")
+    if raw is None or raw[:4] != b"PK\x03\x04": return pd.DataFrame()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        csv_name = next((n for n in zf.namelist() if n.lower().endswith(".csv")), None)
+        if not csv_name: return pd.DataFrame()
+        with zf.open(csv_name) as fh:
+            nri = pd.read_csv(fh, dtype=str, low_memory=False)
+        nri["STCOFIPS"] = nri["STCOFIPS"].astype(str).str.zfill(5)
+        rmap = {"FLDPB_RISKS":"FloodRisk","HWAV_RISKS":"HurricaneRisk","CFLD_RISKS":"CoastalRisk",
+                "TRND_RISKS":"TornadoRisk","WFIR_RISKS":"WildfireRisk","ERQK_RISKS":"EarthquakeRisk","WNTW_RISKS":"WinterRisk"}
+        keep = ["STCOFIPS"] + [k for k in rmap if k in nri.columns]
+        nri = nri[keep].rename(columns=rmap)
+        for col in list(rmap.values()):
+            if col in nri.columns:
+                nri[col] = _norm01(pd.to_numeric(nri[col], errors="coerce"))
+            else:
+                nri[col] = 0.0
+        nri.to_csv(cache, index=False)
+        return nri
+    except Exception:
+        return pd.DataFrame()
 
-    # Try official data loader first if CSV not yet built
-    if not os.path.exists(zip_csv):
-        try:
-            df = build_official_dataset()
-            if not df.empty:
-                return df
-        except ImportError:
-            pass
-        except Exception as e:
-            st.warning(f"Official data loader error: {e}")
+def _load_crosswalk():
+    cache = os.path.join(DATA_DIR, "xwalk.csv")
+    if os.path.exists(cache):
+        return pd.read_csv(cache, dtype=str)
+    raw = _dl("https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_county20_natl.txt", "crosswalk")
+    if raw is None: return pd.DataFrame()
+    try:
+        xw = pd.read_csv(io.BytesIO(raw), sep="|", dtype=str, low_memory=False)
+        xw.columns = [c.strip().upper() for c in xw.columns]
+        zc = next((c for c in xw.columns if "ZCTA" in c and "GEOID" in c), None)
+        cc = next((c for c in xw.columns if "COUNTY" in c and "GEOID" in c), None)
+        ac = next((c for c in xw.columns if "AREALAND" in c), None)
+        if not zc or not cc: return pd.DataFrame()
+        xw = xw.rename(columns={zc:"ZCTA5", cc:"STCOFIPS"})
+        xw["ZCTA5"]    = xw["ZCTA5"].astype(str).str.zfill(5)
+        xw["STCOFIPS"] = xw["STCOFIPS"].astype(str).str.zfill(5)
+        if ac:
+            xw[ac] = pd.to_numeric(xw[ac], errors="coerce").fillna(0)
+            xw = xw.sort_values(ac, ascending=False).drop_duplicates("ZCTA5")[["ZCTA5","STCOFIPS"]]
+        else:
+            xw = xw[["ZCTA5","STCOFIPS"]].drop_duplicates("ZCTA5")
+        xw.to_csv(cache, index=False)
+        return xw
+    except Exception:
+        return pd.DataFrame()
 
-    # Use cached CSV (may be from data_loader or prior Census download)
-    if os.path.exists(zip_csv):
-        try:
-            raw = pd.read_csv(zip_csv, dtype=str)
-            df  = _normalize(raw)
-            if len(df) > 100:
-                risk_cols = ["FloodRisk","TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
-                has_official_risk = all(c in df.columns for c in risk_cols)
-                if not has_official_risk:
-                    df = _enrich(df)
-                if "HistoricalDamage" not in df.columns:
-                    np.random.seed(42)
-                    df["HistoricalDamage"] = np.random.randint(5_000, 2_000_000, len(df))
-                return df
-        except Exception:
-            pass
-
-    # Census ZCTA Gazetteer fallback
+def _load_gazetteer():
+    cache = os.path.join(DATA_DIR, "gazetteer.csv")
+    if os.path.exists(cache):
+        return pd.read_csv(cache, dtype={"ZIP":str})
     for url in [
         "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2023_Gazetteer/2023_Gaz_zcta_national.zip",
         "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2022_Gazetteer/2022_Gaz_zcta_national.zip",
     ]:
+        raw = _dl(url, "Gazetteer")
+        if raw is None or raw[:4] != b"PK\x03\x04": continue
         try:
-            resp = requests.get(url, timeout=30)
-            resp.raise_for_status()
-            if resp.content[:4] != b"PK\x03\x04": continue
-            zf  = zipfile.ZipFile(io.BytesIO(resp.content))
+            zf  = zipfile.ZipFile(io.BytesIO(raw))
             txt = next((n for n in zf.namelist() if n.lower().endswith(".txt")), None)
             if not txt: continue
             with zf.open(txt) as fh:
-                raw = pd.read_csv(fh, sep="\t", dtype=str)
-            raw.columns = [c.strip().upper() for c in raw.columns]
-            raw = raw.rename(columns={"GEOID":"ZIP","INTPTLAT":"Latitude","INTPTLONG":"Longitude"})
-            raw["City"] = ""; raw["State"] = ""; raw["County"] = ""
-            raw["Population"] = np.random.randint(1_000, 40_000, len(raw))
-            df = _normalize(raw)
-            df.to_csv(zip_csv, index=False)
-            return _enrich(df)
+                gaz = pd.read_csv(fh, sep="\t", dtype=str)
+            gaz.columns = [c.strip().upper() for c in gaz.columns]
+            gaz = gaz.rename(columns={"GEOID":"ZIP","INTPTLAT":"Latitude","INTPTLONG":"Longitude"})
+            gaz["ZIP"]       = gaz["ZIP"].astype(str).str.zfill(5)
+            gaz["Latitude"]  = pd.to_numeric(gaz["Latitude"],  errors="coerce")
+            gaz["Longitude"] = pd.to_numeric(gaz["Longitude"], errors="coerce")
+            gaz = gaz.dropna(subset=["Latitude","Longitude"])
+            gaz = gaz[gaz["Latitude"].between(17,72) & gaz["Longitude"].between(-180,-60)]
+            out = gaz[["ZIP","Latitude","Longitude"]].copy()
+            out.to_csv(cache, index=False)
+            return out
         except Exception:
             continue
+    return pd.DataFrame()
 
-    st.warning("Using built-in dataset. Add data_loader.py for full official data.")
-    return _build_synthetic()
+def _load_census_pop():
+    cache = os.path.join(DATA_DIR, "census_pop.csv")
+    if os.path.exists(cache):
+        return pd.read_csv(cache, dtype={"ZIP":str})
+    raw = _dl("https://api.census.gov/data/2020/dec/pl?get=P1_001N&for=zip%20code%20tabulation%20area:*",
+              "Census pop", timeout=120)
+    if raw is None: return pd.DataFrame()
+    try:
+        data = json.loads(raw)
+        df = pd.DataFrame(data[1:], columns=data[0])
+        df = df.rename(columns={"P1_001N":"Population","zip code tabulation area":"ZIP"})
+        df["ZIP"]        = df["ZIP"].astype(str).str.zfill(5)
+        df["Population"] = pd.to_numeric(df["Population"], errors="coerce").fillna(0).astype(int)
+        df[["ZIP","Population"]].to_csv(cache, index=False)
+        return df[["ZIP","Population"]]
+    except Exception:
+        return pd.DataFrame()
 
+def _load_noaa_damage():
+    cache = os.path.join(DATA_DIR, "noaa_damage.csv")
+    if os.path.exists(cache):
+        return pd.read_csv(cache, dtype={"STCOFIPS":str})
+    base = "https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/"
+    all_dfs = []
+    for year in [2023,2022,2021,2020,2019,2018]:
+        r = None
+        for suffix in [f"{year+1}0101","0901","0601","0301"]:
+            r = _dl(base+f"StormEvents_details-ftp_v1.0_d{year}_c{year}{suffix}.csv.gz", f"NOAA {year}")
+            if r: break
+        if r is None: continue
+        try:
+            with gzip.open(io.BytesIO(r)) as gz:
+                df = pd.read_csv(gz, dtype=str, low_memory=False,
+                                 usecols=["STATE_FIPS","CZ_FIPS","DAMAGE_PROPERTY","DAMAGE_CROPS"])
+            all_dfs.append(df)
+        except Exception:
+            continue
+    if not all_dfs: return pd.DataFrame()
+    df = pd.concat(all_dfs, ignore_index=True)
+    def _pdmg(s):
+        if pd.isna(s) or str(s).strip() in ("0",""): return 0.0
+        s = str(s).strip().upper().replace(",","")
+        try:
+            if s.endswith("K"): return float(s[:-1])*1e3
+            if s.endswith("M"): return float(s[:-1])*1e6
+            if s.endswith("B"): return float(s[:-1])*1e9
+            return float(s)
+        except Exception: return 0.0
+    df["dmg"] = df["DAMAGE_PROPERTY"].apply(_pdmg)+df["DAMAGE_CROPS"].apply(_pdmg)
+    df["STCOFIPS"] = df["STATE_FIPS"].astype(str).str.zfill(2)+df["CZ_FIPS"].astype(str).str.zfill(3)
+    result = df.groupby("STCOFIPS")["dmg"].sum().reset_index().rename(columns={"dmg":"HistoricalDamage"})
+    result.to_csv(cache, index=False)
+    return result
 
+def build_official_dataset():
+    """Assemble FEMA + Census + NOAA into one ZIP-level DataFrame."""
+    gaz = _load_gazetteer()
+    if gaz.empty: return pd.DataFrame()
+    df = gaz.copy()
+
+    # Population
+    pop = _load_census_pop()
+    if not pop.empty:
+        df = df.merge(pop, on="ZIP", how="left")
+        df["Population"] = df["Population"].fillna(0).astype(int)
+    else:
+        np.random.seed(42)
+        df["Population"] = np.random.randint(1_000, 40_000, len(df))
+
+    # Always initialise City and State before any merge
+    df["City"]  = ""
+    df["State"] = ""
+
+    # Place names (optional — graceful fallback)
+    try:
+        raw = _dl("https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_place20_natl.txt",
+                  "place names")
+        if raw is not None:
+            names = pd.read_csv(io.BytesIO(raw), sep="|", dtype=str, low_memory=False)
+            names.columns = [c.strip().upper() for c in names.columns]
+            zc = next((c for c in names.columns if "ZCTA" in c and "GEOID" in c), None)
+            nc = next((c for c in names.columns if "NAMELSAD" in c), None)
+            sc = next((c for c in names.columns if "STATEFP" in c or "STATE" in c and "FIPS" in c), None)
+            ac = next((c for c in names.columns if "AREALAND" in c), None)
+            FIPS2ABB = {"01":"AL","02":"AK","04":"AZ","05":"AR","06":"CA","08":"CO","09":"CT",
+                        "10":"DE","11":"DC","12":"FL","13":"GA","15":"HI","16":"ID","17":"IL",
+                        "18":"IN","19":"IA","20":"KS","21":"KY","22":"LA","23":"ME","24":"MD",
+                        "25":"MA","26":"MI","27":"MN","28":"MS","29":"MO","30":"MT","31":"NE",
+                        "32":"NV","33":"NH","34":"NJ","35":"NM","36":"NY","37":"NC","38":"ND",
+                        "39":"OH","40":"OK","41":"OR","42":"PA","44":"RI","45":"SC","46":"SD",
+                        "47":"TN","48":"TX","49":"UT","50":"VT","51":"VA","53":"WA","54":"WV",
+                        "55":"WI","56":"WY","72":"PR","78":"VI"}
+            if zc:
+                names = names.rename(columns={zc:"ZIP"})
+                names["ZIP"] = names["ZIP"].astype(str).str.zfill(5)
+                if ac:
+                    names[ac] = pd.to_numeric(names[ac], errors="coerce").fillna(0)
+                    names = names.sort_values(ac, ascending=False).drop_duplicates("ZIP")
+                if nc:
+                    names["_City"] = (names[nc].astype(str)
+                        .str.replace(r"\s+(city|town|village|CDP|borough)$","",regex=True,case=False)
+                        .str.strip())
+                else:
+                    names["_City"] = ""
+                if sc:
+                    names["_State"] = names[sc].astype(str).str[:2].map(lambda x: FIPS2ABB.get(x,x))
+                else:
+                    names["_State"] = ""
+                names_clean = names[["ZIP","_City","_State"]].drop_duplicates("ZIP")
+                df = df.merge(names_clean, on="ZIP", how="left")
+                # Only fill City/State where we have data
+                mask = df["_City"].notna() & (df["_City"] != "")
+                df.loc[mask, "City"]  = df.loc[mask, "_City"]
+                df.loc[mask, "State"] = df.loc[mask, "_State"].fillna("")
+                df = df.drop(columns=["_City","_State"], errors="ignore")
+    except Exception:
+        pass  # graceful fallback — ZIP prefix table fills names below
+
+    # FEMA NRI risk scores
+    nri   = _load_fema_nri()
+    xwalk = _load_crosswalk()
+    use_synthetic_risk = True
+    if not nri.empty and not xwalk.empty:
+        try:
+            zr = xwalk.rename(columns={"ZCTA5":"ZIP"}).merge(nri, on="STCOFIPS", how="left")
+            df = df.merge(zr.drop(columns=["STCOFIPS"],errors="ignore"), on="ZIP", how="left")
+            risk_fields = ["FloodRisk","HurricaneRisk","CoastalRisk",
+                           "TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
+            for col in risk_fields:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+                else:
+                    df[col] = 0.0
+            use_synthetic_risk = False
+        except Exception:
+            use_synthetic_risk = True
+
+    # NOAA damage
+    noaa = _load_noaa_damage()
+    if not noaa.empty and not xwalk.empty:
+        try:
+            zd = xwalk.rename(columns={"ZCTA5":"ZIP"}).merge(noaa, on="STCOFIPS", how="left")
+            df = df.merge(zd[["ZIP","HistoricalDamage"]], on="ZIP", how="left")
+            df["HistoricalDamage"] = df["HistoricalDamage"].fillna(0)
+        except Exception:
+            np.random.seed(42)
+            df["HistoricalDamage"] = np.random.randint(5_000, 2_000_000, len(df))
+    else:
+        np.random.seed(42)
+        df["HistoricalDamage"] = np.random.randint(5_000, 2_000_000, len(df))
+
+    if use_synthetic_risk:
+        df = _enrich(df)
+
+    # Fill names from prefix table for anything still blank
+    df = _fill_names_from_prefix(df)
+
+    # Final cleanup
+    df["ZIP"]        = df["ZIP"].astype(str).str.zfill(5)
+    df["Population"] = pd.to_numeric(df["Population"], errors="coerce").fillna(0).clip(lower=0).astype(int)
+    risk_cols_all = ["FloodRisk","HurricaneRisk","CoastalRisk","TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
+    for col in risk_cols_all:
+        if col not in df.columns: df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).clip(0,1).round(4)
+    if "HistoricalDamage" not in df.columns:
+        df["HistoricalDamage"] = 0
+    df["HistoricalDamage"] = pd.to_numeric(df["HistoricalDamage"], errors="coerce").fillna(0).clip(lower=0)
+    df = df.dropna(subset=["Latitude","Longitude"])
+    df = df[df["Latitude"].between(17,72) & df["Longitude"].between(-180,-60)]
+    df = df.reset_index(drop=True)
+    df.to_csv(OUTPUT_CSV, index=False)
+    return df
+
+def _fill_names_from_prefix(df):
+    """Fill blank City/State from ZIP prefix lookup tables."""
+    if "City"  not in df.columns: df["City"]  = ""
+    if "State" not in df.columns: df["State"] = ""
+    df["City"]  = df["City"].fillna("").astype(str)
+    df["State"] = df["State"].fillna("").astype(str)
+    mask_c = df["City"].isin(["","Unknown","unknown","nan","None"])  | df["City"].isna()
+    if mask_c.any():
+        df.loc[mask_c,"City"] = df.loc[mask_c,"ZIP"].apply(city_from_zip)
+    mask_s = df["State"].isin(["","Unknown","unknown","nan","None"]) | df["State"].isna()
+    if mask_s.any():
+        df.loc[mask_s,"State"] = df.loc[mask_s,"ZIP"].apply(state_from_zip)
+    def _fb(row):
+        c = str(row["City"]).strip()
+        if c and c not in ("","nan","None"): return c
+        s = str(row.get("State","")).strip()
+        return (s+" area") if s and s not in ("","nan","None") else row["ZIP"]
+    df["City"]  = df.apply(_fb, axis=1)
+    df["State"] = df["State"].fillna("")
+    return df
+
+# ──────────────────────────────────────────────────────────────
+# RISK ENRICHMENT (geographic fallback)
+# ──────────────────────────────────────────────────────────────
+def _enrich(df):
+    np.random.seed(42)
+    n   = len(df)
+    lon = df["Longitude"].values
+    lat = df["Latitude"].values
+    noise = np.random.uniform(0, 0.2, n)
+    east   = np.clip(1-(lon+65)/20,   0,1)
+    gulf   = np.clip(1-(lat-25)/10,   0,1)*np.clip(1-(-lon-80)/20, 0,1)
+    west   = np.clip(1-(-lon-115)/15, 0,1)
+    inland = np.clip(np.sin(np.radians(lat-30))*0.4+0.1, 0,1)
+    df["FloodRisk"]     = np.clip(east*0.35+gulf*0.55+inland+noise,   0,1)
+    df["HurricaneRisk"] = np.clip(gulf*0.80+east*0.35+noise*0.5,      0,1)
+    df["CoastalRisk"]   = np.clip(east*0.50+gulf*0.60+west*0.45+noise*0.4, 0,1)
+    t_alley = np.clip(np.exp(-((lat-37)**2)/50)*np.exp(-((-lon-97)**2)/100), 0,1)
+    d_alley = np.clip(np.exp(-((lat-33)**2)/30)*np.exp(-((-lon-88)**2)/80),  0,1)
+    df["TornadoRisk"]   = np.clip(t_alley*0.9+d_alley*0.75+noise*0.3, 0,1)
+    ca_r    = np.clip(1-(-lon-114)/20, 0,1)*np.clip(1-(lat-32)/25, 0,1)
+    rockies = np.clip(np.exp(-((-lon-106)**2)/80)*np.exp(-((lat-40)**2)/80), 0,1)
+    sw      = np.clip(np.exp(-((-lon-111)**2)/60)*np.exp(-((lat-34)**2)/60), 0,1)
+    df["WildfireRisk"]  = np.clip(ca_r*0.85+rockies*0.70+sw*0.65+noise*0.3, 0,1)
+    w_s  = np.clip(1-(-lon-115)/18, 0,1)*np.clip(1-abs(lat-38)/15, 0,1)
+    nm   = np.clip(np.exp(-((-lon-89)**2)/30)*np.exp(-((lat-36)**2)/20), 0,1)
+    ak   = np.clip(np.exp(-((lat-61)**2)/50), 0,1)
+    df["EarthquakeRisk"]= np.clip(w_s*0.90+nm*0.65+ak*0.70+noise*0.2, 0,1)
+    north  = np.clip((lat-35)/20, 0,1)
+    plains = np.clip(np.exp(-((-lon-100)**2)/120)*np.exp(-((lat-42)**2)/100), 0,1)
+    apps   = np.clip(np.exp(-((-lon-80)**2)/40)*np.exp(-((lat-40)**2)/60),   0,1)
+    df["WinterRisk"]    = np.clip(north*0.80+plains*0.60+apps*0.50+noise*0.3, 0,1)
+    df["HistoricalDamage"] = np.random.randint(5_000, 2_000_000, n)
+    return df
+
+# ──────────────────────────────────────────────────────────────
+# NORMALISE INCOMING CSV
+# ──────────────────────────────────────────────────────────────
 def _normalize(df):
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
@@ -1643,136 +731,354 @@ def _normalize(df):
         if col not in df.columns: df[col] = ""
     if "Population" not in df.columns: df["Population"] = np.random.randint(1_000,40_000,len(df))
     df["ZIP"]        = df["ZIP"].astype(str).str.strip().str.zfill(5)
-    df["Population"] = pd.to_numeric(df["Population"],errors="coerce").fillna(5000).astype(int)
-    mask_c = df["City"].isin(["","Unknown","unknown"]) | df["City"].isna()
-    if mask_c.any(): df.loc[mask_c,"City"] = df.loc[mask_c,"ZIP"].apply(city_from_zip)
-    mask_s = df["State"].isin(["","Unknown","unknown"]) | df["State"].isna()
-    if mask_s.any(): df.loc[mask_s,"State"] = df.loc[mask_s,"ZIP"].apply(state_from_zip)
-    def _fb(row):
-        c = row["City"]
-        if c: return c
-        s = row.get("State","")
-        return (s+" area") if s else row["ZIP"]
-    df["City"]  = df.apply(_fb, axis=1)
-    df["State"] = df["State"].fillna("")
+    df["Population"] = pd.to_numeric(df["Population"], errors="coerce").fillna(5000).astype(int)
+    df = _fill_names_from_prefix(df)
     return df.reset_index(drop=True)
 
-
-def _enrich(df):
-    np.random.seed(42)
-    n   = len(df)
-    lon = df["Longitude"].values
-    lat = df["Latitude"].values
-    noise = np.random.uniform(0, 0.2, n)
-
-    # Water
-    east   = np.clip(1-(lon+65)/20, 0,1)
-    gulf   = np.clip(1-(lat-25)/10, 0,1) * np.clip(1-(-lon-80)/20, 0,1)
-    west   = np.clip(1-(-lon-115)/15, 0,1)
-    inland = np.clip(np.sin(np.radians(lat-30))*0.4+0.1, 0,1)
-    df["FloodRisk"]     = np.clip(east*0.35+gulf*0.55+inland+noise, 0,1)
-    df["HurricaneRisk"] = np.clip(gulf*0.80+east*0.35+noise*0.5, 0,1)
-    df["CoastalRisk"]   = np.clip(east*0.50+gulf*0.60+west*0.45+noise*0.4, 0,1)
-
-    # Tornado — Tornado Alley + Dixie Alley
-    t_alley = np.clip(np.exp(-((lat-37)**2)/50)*np.exp(-((-lon-97)**2)/100), 0,1)
-    d_alley = np.clip(np.exp(-((lat-33)**2)/30)*np.exp(-((-lon-88)**2)/80), 0,1)
-    df["TornadoRisk"] = np.clip(t_alley*0.9+d_alley*0.75+noise*0.3, 0,1)
-
-    # Wildfire — West Coast, Rockies, Southwest
-    ca_risk  = np.clip(1-(-lon-114)/20, 0,1)*np.clip(1-(lat-32)/25, 0,1)
-    rockies  = np.clip(np.exp(-((-lon-106)**2)/80)*np.exp(-((lat-40)**2)/80), 0,1)
-    sw       = np.clip(np.exp(-((-lon-111)**2)/60)*np.exp(-((lat-34)**2)/60), 0,1)
-    df["WildfireRisk"] = np.clip(ca_risk*0.85+rockies*0.70+sw*0.65+noise*0.3, 0,1)
-
-    # Earthquake — West Coast + New Madrid Seismic Zone
-    w_seismic = np.clip(1-(-lon-115)/18, 0,1)*np.clip(1-abs(lat-38)/15, 0,1)
-    nm_zone   = np.clip(np.exp(-((-lon-89)**2)/30)*np.exp(-((lat-36)**2)/20), 0,1)
-    ak_zone   = np.clip(np.exp(-((lat-61)**2)/50), 0,1)
-    df["EarthquakeRisk"] = np.clip(w_seismic*0.90+nm_zone*0.65+ak_zone*0.70+noise*0.2, 0,1)
-
-    # Winter Storm — Northern tier, Great Plains, Appalachians
-    north = np.clip((lat-35)/20, 0,1)
-    plains= np.clip(np.exp(-((-lon-100)**2)/120)*np.exp(-((lat-42)**2)/100), 0,1)
-    apps  = np.clip(np.exp(-((-lon-80)**2)/40)*np.exp(-((lat-40)**2)/60), 0,1)
-    df["WinterRisk"] = np.clip(north*0.80+plains*0.60+apps*0.50+noise*0.3, 0,1)
-
-    df["HistoricalDamage"] = np.random.randint(5_000, 2_000_000, n)
-    return df
-
-
+# ──────────────────────────────────────────────────────────────
+# SYNTHETIC BUILT-IN DATASET
+# ──────────────────────────────────────────────────────────────
 def _build_synthetic():
     np.random.seed(42)
     CITIES = [
-        ("10001","New York","NY","New York",40.748,-73.997,8_336_817),
-        ("90001","Los Angeles","CA","Los Angeles",34.052,-118.244,3_979_576),
-        ("60601","Chicago","IL","Cook",41.878,-87.630,2_693_976),
-        ("77001","Houston","TX","Harris",29.760,-95.370,2_304_580),
-        ("85001","Phoenix","AZ","Maricopa",33.448,-112.074,1_608_139),
-        ("19101","Philadelphia","PA","Philadelphia",39.953,-75.165,1_603_797),
-        ("78201","San Antonio","TX","Bexar",29.424,-98.494,1_434_625),
-        ("92101","San Diego","CA","San Diego",32.716,-117.161,1_386_932),
-        ("75201","Dallas","TX","Dallas",32.777,-96.797,1_304_379),
-        ("78701","Austin","TX","Travis",30.267,-97.743,961_855),
-        ("32099","Jacksonville","FL","Duval",30.332,-81.656,949_611),
-        ("94101","San Francisco","CA","San Francisco",37.775,-122.419,881_549),
-        ("43201","Columbus","OH","Franklin",39.961,-82.999,905_748),
-        ("28201","Charlotte","NC","Mecklenburg",35.227,-80.843,885_708),
-        ("46201","Indianapolis","IN","Marion",39.768,-86.158,876_862),
-        ("98101","Seattle","WA","King",47.606,-122.332,753_675),
-        ("80201","Denver","CO","Denver",39.739,-104.990,727_211),
-        ("37201","Nashville","TN","Davidson",36.163,-86.782,689_447),
-        ("20001","Washington DC","DC","DC",38.907,-77.037,689_545),
-        ("02101","Boston","MA","Suffolk",42.360,-71.059,692_600),
-        ("73101","Oklahoma City","OK","Oklahoma",35.468,-97.516,681_054),
-        ("89701","Las Vegas","NV","Clark",36.170,-115.140,651_319),
-        ("97201","Portland","OR","Multnomah",45.505,-122.675,652_503),
-        ("21201","Baltimore","MD","Baltimore",39.290,-76.612,593_490),
-        ("53201","Milwaukee","WI","Milwaukee",43.039,-87.907,590_157),
-        ("87101","Albuquerque","NM","Bernalillo",35.084,-106.650,560_218),
-        ("85701","Tucson","AZ","Pima",32.223,-110.975,548_073),
-        ("93701","Fresno","CA","Fresno",36.738,-119.787,542_107),
-        ("95814","Sacramento","CA","Sacramento",38.582,-121.494,513_624),
-        ("64101","Kansas City","MO","Jackson",39.100,-94.579,508_090),
-        ("30301","Atlanta","GA","Fulton",33.749,-84.388,498_715),
-        ("68101","Omaha","NE","Douglas",41.257,-95.935,486_051),
-        ("33101","Miami","FL","Miami-Dade",25.762,-80.192,470_914),
-        ("55401","Minneapolis","MN","Hennepin",44.978,-93.265,429_606),
-        ("74101","Tulsa","OK","Tulsa",36.154,-95.993,413_066),
-        ("27601","Raleigh","NC","Wake",35.780,-78.638,474_069),
-        ("70112","New Orleans","LA","Orleans",29.951,-90.072,383_997),
-        ("77550","Galveston","TX","Galveston",29.301,-94.798,50_180),
-        ("33601","Tampa","FL","Hillsborough",27.951,-82.457,399_700),
-        ("36601","Mobile","AL","Mobile",30.695,-88.040,187_041),
-        ("39201","Jackson","MS","Hinds",32.299,-90.185,153_701),
-        ("70801","Baton Rouge","LA","East Baton Rouge",30.452,-91.187,225_374),
-        ("99501","Anchorage","AK","Anchorage",61.218,-149.900,291_247),
-        ("96801","Honolulu","HI","Honolulu",21.307,-157.858,350_964),
-        ("83701","Boise","ID","Ada",43.615,-116.202,235_684),
-        ("84101","Salt Lake City","UT","Salt Lake",40.761,-111.891,200_591),
-        ("89501","Reno","NV","Washoe",39.530,-119.814,250_998),
-        ("58501","Bismarck","ND","Burleigh",46.808,-100.784,73_529),
-        ("57501","Pierre","SD","Hughes",44.368,-100.351,14_003),
-        ("59601","Helena","MT","Lewis and Clark",46.596,-112.027,32_315),
-        ("66101","Kansas City","KS","Wyandotte",39.116,-94.627,156_607),
-        ("72201","Little Rock","AR","Pulaski",34.747,-92.290,202_591),
+        ("10001","New York","NY",40.748,-73.997,8_336_817),
+        ("90001","Los Angeles","CA",34.052,-118.244,3_979_576),
+        ("60601","Chicago","IL",41.878,-87.630,2_693_976),
+        ("77001","Houston","TX",29.760,-95.370,2_304_580),
+        ("85001","Phoenix","AZ",33.448,-112.074,1_608_139),
+        ("19101","Philadelphia","PA",39.953,-75.165,1_603_797),
+        ("78201","San Antonio","TX",29.424,-98.494,1_434_625),
+        ("92101","San Diego","CA",32.716,-117.161,1_386_932),
+        ("75201","Dallas","TX",32.777,-96.797,1_304_379),
+        ("78701","Austin","TX",30.267,-97.743,961_855),
+        ("32099","Jacksonville","FL",30.332,-81.656,949_611),
+        ("94101","San Francisco","CA",37.775,-122.419,881_549),
+        ("43201","Columbus","OH",39.961,-82.999,905_748),
+        ("28201","Charlotte","NC",35.227,-80.843,885_708),
+        ("46201","Indianapolis","IN",39.768,-86.158,876_862),
+        ("98101","Seattle","WA",47.606,-122.332,753_675),
+        ("80201","Denver","CO",39.739,-104.990,727_211),
+        ("37201","Nashville","TN",36.163,-86.782,689_447),
+        ("20001","Washington DC","DC",38.907,-77.037,689_545),
+        ("02101","Boston","MA",42.360,-71.059,692_600),
+        ("73101","Oklahoma City","OK",35.468,-97.516,681_054),
+        ("89701","Las Vegas","NV",36.170,-115.140,651_319),
+        ("97201","Portland","OR",45.505,-122.675,652_503),
+        ("21201","Baltimore","MD",39.290,-76.612,593_490),
+        ("53201","Milwaukee","WI",43.039,-87.907,590_157),
+        ("87101","Albuquerque","NM",35.084,-106.650,560_218),
+        ("85701","Tucson","AZ",32.223,-110.975,548_073),
+        ("93701","Fresno","CA",36.738,-119.787,542_107),
+        ("95814","Sacramento","CA",38.582,-121.494,513_624),
+        ("64101","Kansas City","MO",39.100,-94.579,508_090),
+        ("30301","Atlanta","GA",33.749,-84.388,498_715),
+        ("68101","Omaha","NE",41.257,-95.935,486_051),
+        ("33101","Miami","FL",25.762,-80.192,470_914),
+        ("55401","Minneapolis","MN",44.978,-93.265,429_606),
+        ("74101","Tulsa","OK",36.154,-95.993,413_066),
+        ("27601","Raleigh","NC",35.780,-78.638,474_069),
+        ("70112","New Orleans","LA",29.951,-90.072,383_997),
+        ("77550","Galveston","TX",29.301,-94.798,50_180),
+        ("33601","Tampa","FL",27.951,-82.457,399_700),
+        ("36601","Mobile","AL",30.695,-88.040,187_041),
+        ("39201","Jackson","MS",32.299,-90.185,153_701),
+        ("70801","Baton Rouge","LA",30.452,-91.187,225_374),
+        ("99501","Anchorage","AK",61.218,-149.900,291_247),
+        ("96801","Honolulu","HI",21.307,-157.858,350_964),
+        ("83701","Boise","ID",43.615,-116.202,235_684),
+        ("84101","Salt Lake City","UT",40.761,-111.891,200_591),
+        ("89501","Reno","NV",39.530,-119.814,250_998),
+        ("58501","Bismarck","ND",46.808,-100.784,73_529),
+        ("57501","Pierre","SD",44.368,-100.351,14_003),
+        ("59601","Helena","MT",46.596,-112.027,32_315),
+        ("66101","Kansas City","KS",39.116,-94.627,156_607),
+        ("72201","Little Rock","AR",34.747,-92.290,202_591),
     ]
     rows = []
-    for (zipcode,city,state,county,lat,lon,pop) in CITIES:
-        rows.append({"ZIP":zipcode,"City":city,"State":state,"County":county,
-                     "Latitude":lat,"Longitude":lon,"Population":pop})
+    for (zipcode,city,state,lat,lon,pop) in CITIES:
+        rows.append({"ZIP":zipcode,"City":city,"State":state,"Latitude":lat,"Longitude":lon,"Population":pop})
         for j in range(8):
             a = j*45*np.pi/180; d = np.random.uniform(0.3,1.2)
             nz = str(int(zipcode)+j+1).zfill(5)
             rows.append({"ZIP":nz,"City":city_from_zip(nz) or city,"State":state,
-                         "County":county,"Latitude":lat+d*np.sin(a),
-                         "Longitude":lon+d*np.cos(a),
+                         "Latitude":lat+d*np.sin(a),"Longitude":lon+d*np.cos(a),
                          "Population":int(np.random.randint(5_000,80_000))})
     return _enrich(pd.DataFrame(rows))
 
+# ──────────────────────────────────────────────────────────────
+# PDF REPORT GENERATOR
+# ──────────────────────────────────────────────────────────────
+NAVY=colors.HexColor("#0a1628"); BLUE=colors.HexColor("#1a4a8a")
+CYAN=colors.HexColor("#00b4d8"); LIGHT_BLUE=colors.HexColor("#e8f4fd")
+RED=colors.HexColor("#d62828");  ORANGE=colors.HexColor("#f77f00")
+GREEN=colors.HexColor("#2d6a4f"); LIGHT_GRAY=colors.HexColor("#f5f7fa")
+MID_GRAY=colors.HexColor("#6c757d"); DARK_GRAY=colors.HexColor("#2c3e50")
+WHITE=colors.white
+
+def _risk_color(v):
+    return RED if v>=0.7 else (ORANGE if v>=0.4 else GREEN)
+
+def _risk_label(v):
+    return "HIGH" if v>=0.7 else ("MODERATE" if v>=0.4 else "LOW")
+
+def _risk_bar(label, value, width=4.0):
+    filled = max(1,int(value*20)); empty = 20-filled
+    bc     = _risk_color(value)
+    bar    = Table([[""]*(filled)+[""]*(empty)], colWidths=[width/20*inch]*20, rowHeights=[10])
+    bar.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(filled-1,0),bc),
+        ("BACKGROUND",(filled,0),(-1,0),colors.HexColor("#dde3ea")),
+        ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0),
+        ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+    ]))
+    outer = Table([[
+        Paragraph(f"<b>{label}</b>", ParagraphStyle("bl",fontSize=9,textColor=DARK_GRAY)),
+        bar,
+        Paragraph(f"<font color='#{bc.hexval()[2:]}' size='9'><b>{_risk_label(value)}</b> {value:.2f}</font>",
+                  ParagraphStyle("sc",fontSize=9,alignment=TA_RIGHT)),
+    ]], colWidths=[1.6*inch,width*inch,1.0*inch], rowHeights=[16])
+    outer.setStyle(TableStyle([
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("TOPPADDING",(0,0),(-1,-1),2),("BOTTOMPADDING",(0,0),(-1,-1),2),
+        ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+    ]))
+    return outer
+
+def build_community_report(row, coverage_df, hub_city_labels_df):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf,pagesize=letter,leftMargin=0.75*inch,rightMargin=0.75*inch,
+                            topMargin=0.75*inch,bottomMargin=0.75*inch)
+    styles = getSampleStyleSheet(); story = []
+    ls = ParagraphStyle; ts = lambda n,**kw: ls(n,**kw)
+
+    city=str(row.get("City","")); state=str(row.get("State",""))
+    zip_code=str(row.get("ZIP","")); population=int(row.get("Population",0))
+    flood_risk=float(row.get("FloodRisk",0)); hurr_risk=float(row.get("HurricaneRisk",0))
+    coast_risk=float(row.get("CoastalRisk",0)); tornado_risk=float(row.get("TornadoRisk",0))
+    wildfire_risk=float(row.get("WildfireRisk",0)); quake_risk=float(row.get("EarthquakeRisk",0))
+    winter_risk=float(row.get("WinterRisk",0)); risk_weight=float(row.get("RiskWeight",0))
+    hub_id=int(row.get("NearestHub",0)); dist_miles=float(row.get("DistanceMiles",0))
+    travel_min=float(row.get("TravelMinutes",0)); hist_damage=float(row.get("HistoricalDamage",0))
+
+    cov = coverage_df[coverage_df["HubID"]==hub_id]
+    hub_city  = str(cov["HubCity"].iloc[0])  if len(cov) else "Hub Area"
+    hub_state = str(cov["HubState"].iloc[0]) if len(cov) else ""
+    hub_pop   = int(cov["PopulationCovered"].iloc[0]) if len(cov) else 0
+    hub_zips  = int(cov["ZIPsCovered"].iloc[0])       if len(cov) else 0
+    hub_avg   = float(cov["AvgTravelMinutes"].iloc[0]) if len(cov) else 0
+    overall   = (flood_risk+hurr_risk+coast_risk+tornado_risk+wildfire_risk+quake_risk+winter_risk)/7
+    generated = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+
+    # Header
+    ht = Table([[
+        Paragraph("DISASTERHUB", ts("hh",fontSize=9,textColor=CYAN,fontName="Helvetica-Bold",alignment=TA_LEFT)),
+        Paragraph("COMMUNITY RISK REPORT", ts("cr",fontSize=9,textColor=colors.HexColor("#90caf9"),fontName="Helvetica",alignment=TA_RIGHT)),
+    ]], colWidths=[3.5*inch,3.5*inch], rowHeights=[20])
+    ht.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),NAVY),("TOPPADDING",(0,0),(-1,-1),4),
+                            ("BOTTOMPADDING",(0,0),(-1,-1),4),("LEFTPADDING",(0,0),(0,-1),8),
+                            ("RIGHTPADDING",(-1,0),(-1,-1),8),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+    story += [ht, Spacer(1,0.15*inch)]
+
+    # Title
+    tt = Table([[
+        Paragraph(f"{city}, {state}", ts("ti",fontSize=22,textColor=WHITE,fontName="Helvetica-Bold",alignment=TA_LEFT,leading=26)),
+        Paragraph(f"Overall Risk<br/><font size='18' color='#{_risk_color(overall).hexval()[2:]}'>{_risk_label(overall)}</font>",
+                  ts("or",fontSize=10,textColor=colors.HexColor("#90caf9"),fontName="Helvetica",alignment=TA_RIGHT,leading=22)),
+    ]], colWidths=[4.5*inch,2.5*inch], rowHeights=[50])
+    tt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),BLUE),("TOPPADDING",(0,0),(-1,-1),10),
+                            ("BOTTOMPADDING",(0,0),(-1,-1),10),("LEFTPADDING",(0,0),(0,-1),12),
+                            ("RIGHTPADDING",(-1,0),(-1,-1),12),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+    story.append(tt)
+    st2 = Table([[
+        Paragraph(f"ZIP {zip_code}  ·  Population {population:,}  ·  Est. damage ${hist_damage:,.0f}",
+                  ts("s2",fontSize=9,textColor=MID_GRAY,fontName="Helvetica")),
+        Paragraph(f"Generated {generated}", ts("sm",fontSize=8,textColor=MID_GRAY,fontName="Helvetica",leading=12)),
+    ]], colWidths=[4.5*inch,2.5*inch], rowHeights=[18])
+    st2.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),LIGHT_GRAY),("TOPPADDING",(0,0),(-1,-1),4),
+                             ("BOTTOMPADDING",(0,0),(-1,-1),4),("LEFTPADDING",(0,0),(0,-1),12),
+                             ("RIGHTPADDING",(-1,0),(-1,-1),12),("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+                             ("ALIGN",(-1,0),(-1,-1),"RIGHT")]))
+    story += [st2, Spacer(1,0.2*inch)]
+
+    # Key metrics
+    def mc(label,val,sub=""):
+        return [
+            [Paragraph(label, ts("lbl",fontSize=8,textColor=MID_GRAY,fontName="Helvetica",alignment=TA_CENTER))],
+            [Paragraph(val,   ts("val",fontSize=16,textColor=DARK_GRAY,fontName="Helvetica-Bold",alignment=TA_CENTER))],
+            [Paragraph(sub,   ts("sub",fontSize=8,textColor=MID_GRAY,fontName="Helvetica",alignment=TA_CENTER))],
+        ]
+    mt = Table([[
+        Table(mc("NEAREST HUB",   f"Hub {hub_id}",       f"{hub_city}, {hub_state}"), colWidths=[1.75*inch], rowHeights=[14,22,14]),
+        Table(mc("DISTANCE",       f"{dist_miles:.1f} mi","straight line"),            colWidths=[1.75*inch], rowHeights=[14,22,14]),
+        Table(mc("RESPONSE TIME",  f"{travel_min:.0f} min","estimated"),               colWidths=[1.75*inch], rowHeights=[14,22,14]),
+        Table(mc("RISK SCORE",     f"{risk_weight:,.0f}", "weighted exposure"),        colWidths=[1.75*inch], rowHeights=[14,22,14]),
+    ]], colWidths=[1.75*inch]*4, rowHeights=[60])
+    mt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),LIGHT_BLUE),("TOPPADDING",(0,0),(-1,-1),8),
+                            ("BOTTOMPADDING",(0,0),(-1,-1),8),("LEFTPADDING",(0,0),(-1,-1),6),
+                            ("RIGHTPADDING",(0,0),(-1,-1),6),("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+                            ("LINEBEFORE",(1,0),(-1,-1),0.5,colors.HexColor("#c5d8ed")),
+                            ("BOX",(0,0),(-1,-1),0.5,colors.HexColor("#c5d8ed"))]))
+    story += [mt, Spacer(1,0.25*inch)]
+
+    # Risk section
+    def section_hdr(title):
+        t = Table([[Paragraph(title, ts("sh",fontSize=11,textColor=WHITE,fontName="Helvetica-Bold",alignment=TA_LEFT))]],
+                  colWidths=[7.0*inch], rowHeights=[24])
+        t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),NAVY),("TOPPADDING",(0,0),(-1,-1),6),
+                               ("BOTTOMPADDING",(0,0),(-1,-1),6),("LEFTPADDING",(0,0),(-1,-1),10)]))
+        return t
+
+    story += [section_hdr("MULTI-HAZARD RISK ASSESSMENT"), Spacer(1,0.1*inch)]
+    rc = Table([
+        [_risk_bar("Flood Risk",       flood_risk,   4.0)],
+        [_risk_bar("Hurricane Risk",   hurr_risk,    4.0)],
+        [_risk_bar("Coastal Risk",     coast_risk,   4.0)],
+        [_risk_bar("Tornado Risk",     tornado_risk, 4.0)],
+        [_risk_bar("Wildfire Risk",    wildfire_risk,4.0)],
+        [_risk_bar("Earthquake Risk",  quake_risk,   4.0)],
+        [_risk_bar("Winter Storm Risk",winter_risk,  4.0)],
+    ], colWidths=[7.0*inch])
+    rc.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),LIGHT_GRAY),("TOPPADDING",(0,0),(-1,-1),5),
+                            ("BOTTOMPADDING",(0,0),(-1,-1),5),("LEFTPADDING",(0,0),(-1,-1),12),
+                            ("RIGHTPADDING",(0,0),(-1,-1),12),("LINEBELOW",(0,0),(-1,-2),0.5,colors.HexColor("#dde3ea")),
+                            ("BOX",(0,0),(-1,-1),0.5,colors.HexColor("#c5d8ed"))]))
+    story += [rc, Spacer(1,0.25*inch)]
+
+    # Hub details
+    story += [section_hdr("NEAREST EMERGENCY HUB"), Spacer(1,0.1*inch)]
+    hdet = [["Hub ID",f"Hub {hub_id}"],["Nearest City",f"{hub_city}, {hub_state}"],
+            ["Distance",f"{dist_miles:.1f} miles"],["Est. Travel Time",f"{travel_min:.0f} minutes"],
+            ["Population Served",f"{hub_pop:,} people"],["ZIPs Covered",f"{hub_zips} ZIP codes"],
+            ["Avg Travel (hub-wide)",f"{hub_avg:.0f} minutes"]]
+    htbl = Table([[Paragraph(k,ts("k",fontSize=9,fontName="Helvetica-Bold",textColor=DARK_GRAY)),
+                   Paragraph(v,ts("v",fontSize=9,fontName="Helvetica",textColor=BLUE))]
+                  for k,v in hdet], colWidths=[2.8*inch,4.2*inch])
+    htbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),WHITE),("BACKGROUND",(0,0),(-1,0),LIGHT_BLUE),
+                              ("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6),
+                              ("LEFTPADDING",(0,0),(-1,-1),10),("RIGHTPADDING",(0,0),(-1,-1),10),
+                              ("LINEBELOW",(0,0),(-1,-2),0.5,colors.HexColor("#dde3ea")),
+                              ("BOX",(0,0),(-1,-1),0.5,colors.HexColor("#c5d8ed")),
+                              ("ROWBACKGROUNDS",(0,0),(-1,-1),[WHITE,LIGHT_GRAY])]))
+    story += [htbl, Spacer(1,0.25*inch)]
+
+    # Recommendations
+    story += [section_hdr("EMERGENCY PREPAREDNESS RECOMMENDATIONS"), Spacer(1,0.1*inch)]
+    recs = []
+    if flood_risk>=0.7:   recs.append("HIGH flood risk. Pre-position flood response equipment within 30 miles.")
+    if hurr_risk>=0.7:    recs.append("HIGH hurricane risk. Establish evacuation route plans and shelter-in-place protocols.")
+    if tornado_risk>=0.7: recs.append("HIGH tornado risk. Ensure community has storm shelters and warning systems.")
+    if wildfire_risk>=0.7:recs.append("HIGH wildfire risk. Defensible space and evacuation routes should be established.")
+    if quake_risk>=0.7:   recs.append("HIGH earthquake risk. Structural assessments and emergency supply caches recommended.")
+    if winter_risk>=0.7:  recs.append("HIGH winter storm risk. Ensure warming centers and road treatment capacity.")
+    if travel_min>90:     recs.append(f"Response time of {travel_min:.0f} min exceeds the 90-min critical threshold. Consider an additional hub.")
+    if travel_min<=60:    recs.append(f"Response time of {travel_min:.0f} min meets the 60-min target. Current hub placement is effective.")
+    if not recs:          recs.append("No critical risk thresholds exceeded. Continue monitoring.")
+    bstyle = ParagraphStyle("bs",fontSize=9,textColor=DARK_GRAY,fontName="Helvetica",leading=14)
+    rtbl = Table([[Paragraph(f"• {r}",bstyle)] for r in recs], colWidths=[7.0*inch])
+    rtbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),LIGHT_GRAY),("TOPPADDING",(0,0),(-1,-1),7),
+                              ("BOTTOMPADDING",(0,0),(-1,-1),7),("LEFTPADDING",(0,0),(-1,-1),14),
+                              ("RIGHTPADDING",(0,0),(-1,-1),12),("LINEBELOW",(0,0),(-1,-2),0.5,colors.HexColor("#dde3ea")),
+                              ("BOX",(0,0),(-1,-1),0.5,colors.HexColor("#c5d8ed"))]))
+    story += [rtbl, Spacer(1,0.3*inch)]
+
+    # Footer
+    story.append(HRFlowable(width="100%",thickness=0.5,color=colors.HexColor("#c5d8ed")))
+    story.append(Spacer(1,0.06*inch))
+    ftbl = Table([[
+        Paragraph("DisasterHub  ·  FEMA National Risk Index, US Census, NOAA Storm Events  ·  Planning purposes only.",
+                  ParagraphStyle("ft",fontSize=7,textColor=MID_GRAY,fontName="Helvetica")),
+        Paragraph(f"Generated {generated}",
+                  ParagraphStyle("fr",fontSize=7,textColor=MID_GRAY,fontName="Helvetica",alignment=TA_RIGHT)),
+    ]], colWidths=[5.0*inch,2.0*inch])
+    ftbl.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"TOP"),("TOPPADDING",(0,0),(-1,-1),0),
+                              ("BOTTOMPADDING",(0,0),(-1,-1),0),("LEFTPADDING",(0,0),(-1,-1),0),
+                              ("RIGHTPADDING",(0,0),(-1,-1),0)]))
+    story.append(ftbl)
+    doc.build(story)
+    return buf.getvalue()
 
 # ──────────────────────────────────────────────────────────────
-# LOAD
+# NOAA LIVE ALERTS
+# ──────────────────────────────────────────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_noaa_alerts():
+    try:
+        r = requests.get(
+            "https://api.weather.gov/alerts/active",
+            params={"event": "Flood Watch,Flood Warning,Hurricane Watch,Hurricane Warning,"
+                             "Flash Flood Warning,Tornado Watch,Tornado Warning,"
+                             "Winter Storm Warning,Winter Storm Watch,Red Flag Warning,Fire Weather Watch"},
+            headers={"User-Agent": "DisasterHub/1.0"}, timeout=8)
+        if r.status_code == 200:
+            alerts = []
+            for f in r.json().get("features",[])[:5]:
+                p = f.get("properties",{})
+                alerts.append({"event":p.get("event","Alert"),"areas":p.get("areaDesc",""),"severity":p.get("severity","Unknown")})
+            return alerts
+    except Exception:
+        pass
+    return []
+
+# ──────────────────────────────────────────────────────────────
+# MAIN DATA LOADER
+# ──────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Loading official government datasets…")
+def build_datasets():
+    # 1. Try official pipeline (downloads FEMA + Census + NOAA)
+    if not os.path.exists(OUTPUT_CSV):
+        try:
+            df = build_official_dataset()
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            st.warning(f"Official data pipeline error: {e}")
+
+    # 2. Use cached CSV
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            raw = pd.read_csv(OUTPUT_CSV, dtype=str)
+            df  = _normalize(raw)
+            if len(df) > 100:
+                risk_cols = ["FloodRisk","TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
+                if not all(c in df.columns for c in risk_cols):
+                    df = _enrich(df)
+                if "HistoricalDamage" not in df.columns:
+                    np.random.seed(42)
+                    df["HistoricalDamage"] = np.random.randint(5_000,2_000_000,len(df))
+                return df
+        except Exception:
+            pass
+
+    # 3. Census Gazetteer direct download
+    for url in [
+        "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2023_Gazetteer/2023_Gaz_zcta_national.zip",
+        "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2022_Gazetteer/2022_Gaz_zcta_national.zip",
+    ]:
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            if resp.content[:4] != b"PK\x03\x04": continue
+            zf = zipfile.ZipFile(io.BytesIO(resp.content))
+            txt = next((n for n in zf.namelist() if n.lower().endswith(".txt")), None)
+            if not txt: continue
+            with zf.open(txt) as fh:
+                raw = pd.read_csv(fh, sep="\t", dtype=str)
+            raw.columns = [c.strip().upper() for c in raw.columns]
+            raw = raw.rename(columns={"GEOID":"ZIP","INTPTLAT":"Latitude","INTPTLONG":"Longitude"})
+            raw["City"]=""; raw["State"]=""; raw["County"]=""
+            raw["Population"] = np.random.randint(1_000,40_000,len(raw))
+            df = _normalize(raw)
+            df.to_csv(OUTPUT_CSV, index=False)
+            return _enrich(df)
+        except Exception:
+            continue
+
+    # 4. Synthetic fallback
+    st.warning("Using built-in dataset — all features still work.")
+    return _build_synthetic()
+
+# ──────────────────────────────────────────────────────────────
+# LOAD DATA
 # ──────────────────────────────────────────────────────────────
 df = build_datasets()
 
@@ -1781,27 +1087,25 @@ df = build_datasets()
 # ──────────────────────────────────────────────────────────────
 st.sidebar.title("DisasterHub Controls")
 disaster_choice = st.sidebar.selectbox(
-    "Disaster type",
-    list(DISASTER_TYPES.keys()),
-    format_func=lambda x: f"{DISASTER_TYPES[x]['icon']} {x}",
-)
+    "Disaster type", list(DISASTER_TYPES.keys()),
+    format_func=lambda x: f"{DISASTER_TYPES[x]['icon']} {x}")
 st.sidebar.markdown("---")
 hub_count    = st.sidebar.slider("Emergency hubs to deploy",   3, 60, 15)
-flood_mult   = st.sidebar.slider("Flood / Hurricane Weight",  0.1, 3.0, 1.0)
-tornado_mult = st.sidebar.slider("Tornado / Storm Weight",    0.1, 3.0, 1.0)
-fire_mult    = st.sidebar.slider("Wildfire Weight",           0.1, 3.0, 1.0)
-quake_mult   = st.sidebar.slider("Earthquake Weight",         0.1, 3.0, 1.0)
-winter_mult  = st.sidebar.slider("Winter Storm Weight",       0.1, 3.0, 1.0)
+flood_mult   = st.sidebar.slider("Flood / Hurricane Weight",  0.1,3.0,1.0)
+tornado_mult = st.sidebar.slider("Tornado / Storm Weight",    0.1,3.0,1.0)
+fire_mult    = st.sidebar.slider("Wildfire Weight",           0.1,3.0,1.0)
+quake_mult   = st.sidebar.slider("Earthquake Weight",         0.1,3.0,1.0)
+winter_mult  = st.sidebar.slider("Winter Storm Weight",       0.1,3.0,1.0)
 st.sidebar.markdown("---")
 st.sidebar.subheader("Check your community's risk")
 zip_lookup = st.sidebar.text_input("Enter ZIP code or city name")
 st.sidebar.markdown("---")
 st.sidebar.subheader("Disaster Scenario Simulation")
-flood_scenario   = st.sidebar.slider("Flood / Hurricane Severity", 0.0, 2.0, 1.0)
-tornado_scenario = st.sidebar.slider("Tornado Severity",           0.0, 2.0, 1.0)
-fire_scenario    = st.sidebar.slider("Wildfire Severity",          0.0, 2.0, 1.0)
-quake_scenario   = st.sidebar.slider("Earthquake Severity",        0.0, 2.0, 1.0)
-winter_scenario  = st.sidebar.slider("Winter Storm Severity",      0.0, 2.0, 1.0)
+flood_scenario   = st.sidebar.slider("Flood / Hurricane Severity",0.0,2.0,1.0)
+tornado_scenario = st.sidebar.slider("Tornado Severity",          0.0,2.0,1.0)
+fire_scenario    = st.sidebar.slider("Wildfire Severity",         0.0,2.0,1.0)
+quake_scenario   = st.sidebar.slider("Earthquake Severity",       0.0,2.0,1.0)
+winter_scenario  = st.sidebar.slider("Winter Storm Severity",     0.0,2.0,1.0)
 top_n = st.sidebar.slider("Top N Recommended Hubs", 1, 20, 10)
 
 # ──────────────────────────────────────────────────────────────
@@ -1832,7 +1136,7 @@ else:
 @st.cache_data(show_spinner="Optimising hub locations…")
 def optimize_hubs(lats, lons, weights, k):
     coords = np.column_stack([lats, lons])
-    w = weights / (weights.sum()+1e-9)
+    w = weights/(weights.sum()+1e-9)
     idx = np.random.choice(len(coords), size=min(20_000,len(coords)*5), p=w, replace=True)
     km = KMeans(n_clusters=k, n_init=15, random_state=42, max_iter=500)
     km.fit(coords[idx])
@@ -1850,7 +1154,6 @@ def compute_baseline(lats, lons, k):
     return float((dist.min(axis=1)/55.0*60.0+15.0).mean())
 
 hubs = optimize_hubs(df["Latitude"].values, df["Longitude"].values, df["RiskWeight"].values, hub_count)
-
 dist_matrix         = haversine_matrix(df["Latitude"].values, df["Longitude"].values,
                                         hubs["Latitude"].values, hubs["Longitude"].values)
 df["NearestHub"]    = dist_matrix.argmin(axis=1)
@@ -1879,19 +1182,18 @@ top_recommended = (
 )
 
 # ──────────────────────────────────────────────────────────────
-# HEADER
+# PAGE HEADER
 # ──────────────────────────────────────────────────────────────
 d_icon = DISASTER_TYPES[disaster_choice]["icon"]
 st.title("DisasterHub — Getting emergency help to every community faster")
 st.caption(f"Now optimizing: {d_icon} {disaster_choice}  ·  Flood · Tornado · Wildfire · Earthquake · Winter Storm")
 
-# Data source provenance badge
-risk_cols = ["FloodRisk","TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
-has_official = all(c in df.columns for c in risk_cols) and df["FloodRisk"].max() > 0
+risk_cols_check = ["FloodRisk","TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
+has_official = all(c in df.columns for c in risk_cols_check) and df["FloodRisk"].max() > 0
 if has_official:
-    st.success("Data sources: **FEMA National Risk Index** · **US Census 2020** · **NOAA Storm Events 2018–2023** · **NOAA Weather API** (live alerts)", icon="✅")
+    st.success("Data: **FEMA National Risk Index** · **US Census 2020** · **NOAA Storm Events** · **NOAA Live Alerts**", icon="✅")
 else:
-    st.info("Running on geographic heuristics. Run **data_loader.py** on Replit to load official FEMA + Census + NOAA data.", icon="ℹ️")
+    st.info("Running on geographic heuristics. Official FEMA + Census + NOAA data loads automatically on first run.", icon="ℹ️")
 
 with st.expander("Why I built this — the story behind DisasterHub"):
     st.markdown("""
@@ -1928,7 +1230,7 @@ st.markdown("#### Population coverage by response time")
 total_pop = max(df["Population"].sum(), 1)
 pct_60 = float(df[df["TravelMinutes"]<60]["Population"].sum()/total_pop)
 pct_90 = float(df[df["TravelMinutes"]<90]["Population"].sum()/total_pop)
-ca, cb = st.columns(2)
+ca,cb = st.columns(2)
 with ca:
     st.metric("Within 60 minutes", f"{pct_60*100:.1f}% of population")
     st.progress(min(pct_60,1.0))
@@ -1940,16 +1242,16 @@ with cb:
 st.markdown("#### Optimized placement vs random baseline")
 baseline_avg  = compute_baseline(df["Latitude"].values, df["Longitude"].values, hub_count)
 optimized_avg = float(df["TravelMinutes"].mean())
-improvement   = ((baseline_avg-optimized_avg)/baseline_avg*100) if baseline_avg > 0 else 0
+improvement   = ((baseline_avg-optimized_avg)/baseline_avg*100) if baseline_avg>0 else 0
 b1,b2,b3 = st.columns(3)
-b1.metric("Baseline avg travel time",  f"{baseline_avg:.0f} min",  help="Random hub placement, no optimization")
+b1.metric("Baseline avg travel time",  f"{baseline_avg:.0f} min", help="Random hub placement")
 b2.metric("Optimized avg travel time", f"{optimized_avg:.0f} min", delta=f"-{baseline_avg-optimized_avg:.0f} min")
 b3.metric("Response time improvement", f"{improvement:.1f}%")
 
-# All-disaster risk summary
+# Multi-hazard profile
 st.markdown("#### Multi-hazard risk profile")
-risk_cols = st.columns(7)
-for col, (label, field, icon) in zip(risk_cols, [
+rcols = st.columns(7)
+for col,(label,field,icon) in zip(rcols,[
     ("Flood","FloodRisk","🌊"),("Hurricane","HurricaneRisk","🌀"),
     ("Tornado","TornadoRisk","🌪️"),("Wildfire","WildfireRisk","🔥"),
     ("Earthquake","EarthquakeRisk","🏚️"),("Winter","WinterRisk","❄️"),
@@ -1995,14 +1297,11 @@ if zip_lookup.strip():
         if len(match) > 1:
             with st.expander(f"See all {min(len(match),20)} matches for '{q}'"):
                 show_cols = ["ZIP","City","State","Population","FloodRisk","TornadoRisk",
-                             "WildfireRisk","EarthquakeRisk","WinterRisk",
-                             "DistanceMiles","TravelMinutes","NearestHub"]
-                st.dataframe(
-                    match.head(20)[show_cols].style.format({
-                        "Population":"{:,.0f}","FloodRisk":"{:.3f}","TornadoRisk":"{:.3f}",
-                        "WildfireRisk":"{:.3f}","EarthquakeRisk":"{:.3f}","WinterRisk":"{:.3f}",
-                        "DistanceMiles":"{:.1f}","TravelMinutes":"{:.0f}",
-                    }), use_container_width=True)
+                             "WildfireRisk","EarthquakeRisk","WinterRisk","DistanceMiles","TravelMinutes","NearestHub"]
+                st.dataframe(match.head(20)[show_cols].style.format({
+                    "Population":"{:,.0f}","FloodRisk":"{:.3f}","TornadoRisk":"{:.3f}",
+                    "WildfireRisk":"{:.3f}","EarthquakeRisk":"{:.3f}","WinterRisk":"{:.3f}",
+                    "DistanceMiles":"{:.1f}","TravelMinutes":"{:.0f}"}), use_container_width=True)
     else:
         st.warning(f"No match for '{q}'. Try a 5-digit ZIP or city name.")
 
@@ -2110,7 +1409,7 @@ with st.expander("About DisasterHub — data sources, methods & what's next"):
         st.markdown("""
         **What it does**
         - Maps all US ZIP codes with population and risk scores for 7 disaster types
-        - Weighted K-Means places hubs where they minimize response time for selected disaster
+        - Weighted K-Means places hubs where they minimize response time
         - Assigns every ZIP to its nearest hub with distance and travel time
         - Simulates scenarios with per-disaster severity sliders
         - Looks up any ZIP or city for a full multi-hazard risk profile
@@ -2133,15 +1432,15 @@ with st.expander("About DisasterHub — data sources, methods & what's next"):
 
         **Disaster types covered**
         - 🌊 Flood & Hurricane (coastal + inland)
-        - 🌪️ Tornado / Severe Storms (Tornado Alley + Dixie Alley)
+        - 🌪️ Tornado (Tornado Alley + Dixie Alley)
         - 🔥 Wildfire (West Coast, Rockies, Southwest)
         - 🏚️ Earthquake (West Coast, New Madrid Seismic Zone)
         - ❄️ Winter Storm (Northern tier, Great Plains, Appalachians)
 
         **What's next**
         - Real FEMA flood zone & wildfire perimeter polygons
-        - OpenStreetMap road network routing
-        - ML models trained on FEMA damage data
+        - OpenStreetMap road network routing for real drive times
+        - ML models trained on FEMA historical damage data
         - Live alert-driven hub reallocation suggestions
         """)
 
@@ -2163,7 +1462,7 @@ with tab1:
     st.dataframe(disp.style.format({"PopulationCovered":"{:,.0f}","AvgDistanceMiles":"{:.1f}",
                                      "AvgTravelMinutes":"{:.0f}","RiskExposure":"{:,.0f}"}),
                  use_container_width=True)
-    st.download_button("Download Hub Coverage Report", disp.to_csv(index=False), "hub_coverage.csv","text/csv")
+    st.download_button("Download Hub Coverage Report", disp.to_csv(index=False),"hub_coverage.csv","text/csv")
 
 with tab2:
     st.subheader("Top 100 highest-risk communities")

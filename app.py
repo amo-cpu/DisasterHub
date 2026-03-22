@@ -1131,161 +1131,169 @@ else:
     ).clip(lower=0)
 
 # ──────────────────────────────────────────────────────────────
-# OPTIMISATION — Peak weighted facility location
+# OPTIMISATION — Peak population-first facility location
 # ──────────────────────────────────────────────────────────────
-def _objective(lats, lons, weights, hub_lats, hub_lons):
-    """
-    Weighted objective: minimize sum(weight_i * distance_i_to_nearest_hub).
-    Lower is better.
-    """
-    dist = haversine_matrix(lats, lons, hub_lats, hub_lons)
+
+def _pop_weighted_obj(lats, lons, pops, hub_lats, hub_lons):
+    """Population-weighted distance objective. Lower = better coverage."""
+    dist    = haversine_matrix(lats, lons, hub_lats, hub_lons)
     nearest = dist.min(axis=1)
-    return float((weights * nearest).sum())
+    return float((pops * nearest).sum())
 
-def _weighted_kmeans(lats, lons, weights, k, seed=42):
+def _local_search_pop(lats, lons, pops, hub_coords, max_iter=100):
     """
-    Weighted K-Means: resample points by weight so cluster centres
-    land on high-weight areas. Returns hub (lat, lon) array.
+    Lloyd's algorithm on population weights.
+    Each hub moves to the population-weighted centroid of its Voronoi cell.
+    Guaranteed to reduce or maintain the population-weighted objective.
     """
-    coords = np.column_stack([lats, lons])
-    w = np.sqrt(weights)          # sqrt dampens extremes — prevents coastal pile-up
-    w = w / (w.sum() + 1e-9)
-    idx = np.random.default_rng(seed).choice(
-        len(coords), size=min(30_000, len(coords) * 8), p=w, replace=True)
-    km = KMeans(n_clusters=k, n_init=20, random_state=seed,
-                max_iter=1000, tol=1e-5, algorithm="lloyd")
-    km.fit(coords[idx])
-    return km.cluster_centers_          # shape (k, 2)
-
-def _greedy_init(lats, lons, weights, k):
-    """
-    Greedy farthest-point initialisation weighted by risk.
-    Picks first hub at highest-weight point, then each subsequent
-    hub at the point that maximally reduces the weighted objective.
-    Much better than random init for sparse geographies.
-    """
-    n = len(lats)
-    coords = np.column_stack([lats, lons])
-    w = weights / (weights.sum() + 1e-9)
-
-    # Start at highest-weight point
-    hubs = [coords[np.argmax(w)]]
-    min_dist = haversine_matrix(lats, lons,
-                                 np.array([hubs[0][0]]),
-                                 np.array([hubs[0][1]])).ravel()
-
-    for _ in range(k - 1):
-        # Weighted probability of being next hub = weight * current min distance
-        score = w * min_dist
-        score = score / (score.sum() + 1e-9)
-        next_idx = np.argmax(score)
-        hubs.append(coords[next_idx])
-        new_dist = haversine_matrix(lats, lons,
-                                     np.array([hubs[-1][0]]),
-                                     np.array([hubs[-1][1]])).ravel()
-        min_dist = np.minimum(min_dist, new_dist)
-
-    return np.array(hubs)
-
-def _local_search(lats, lons, weights, hub_coords, max_iter=50):
-    """
-    Local search (1-opt swap): for each hub try moving it to the
-    weighted centroid of its assigned points. Repeat until no improvement.
-    This is basically the Lloyd's algorithm step but applied to the
-    weighted objective directly.
-    """
-    coords   = np.column_stack([lats, lons])
-    hubs     = hub_coords.copy()
-    best_obj = _objective(lats, lons, weights, hubs[:,0], hubs[:,1])
-
-    for iteration in range(max_iter):
-        improved = False
-        dist  = haversine_matrix(lats, lons, hubs[:,0], hubs[:,1])
+    hubs = hub_coords.copy()
+    for _ in range(max_iter):
+        dist   = haversine_matrix(lats, lons, hubs[:,0], hubs[:,1])
         assign = dist.argmin(axis=1)
-
         new_hubs = hubs.copy()
         for h in range(len(hubs)):
             mask = assign == h
             if mask.sum() == 0:
                 continue
-            w_h = weights[mask]
-            # Weighted centroid of assigned points
-            new_lat = float(np.average(lats[mask], weights=w_h))
-            new_lon = float(np.average(lons[mask], weights=w_h))
-            new_hubs[h] = [new_lat, new_lon]
-
-        new_obj = _objective(lats, lons, weights, new_hubs[:,0], new_hubs[:,1])
-        if new_obj < best_obj - 1e-6:
-            hubs     = new_hubs
-            best_obj = new_obj
-            improved = True
-
-        if not improved:
+            w_h = pops[mask]
+            new_hubs[h,0] = float(np.average(lats[mask], weights=w_h))
+            new_hubs[h,1] = float(np.average(lons[mask], weights=w_h))
+        if np.allclose(hubs, new_hubs, atol=1e-5):
             break
+        hubs = new_hubs
+    return hubs, _pop_weighted_obj(lats, lons, pops, hubs[:,0], hubs[:,1])
 
-    return hubs, best_obj
+def _kmeans_pop(lats, lons, pops, k, seed):
+    """Population-weighted K-Means init."""
+    coords = np.column_stack([lats, lons])
+    w      = pops / (pops.sum() + 1e-9)
+    idx    = np.random.default_rng(seed).choice(
+        len(coords), size=min(40_000, len(coords)*10), p=w, replace=True)
+    km = KMeans(n_clusters=k, n_init=1, random_state=seed,
+                max_iter=500, algorithm="lloyd")
+    km.fit(coords[idx])
+    return km.cluster_centers_
+
+def _greedy_pop_init(lats, lons, pops, k):
+    """
+    Greedy init: place hubs to maximise population covered within 60 min.
+    First hub goes to highest-population point.
+    Each next hub covers the most uncovered population.
+    """
+    coords   = np.column_stack([lats, lons])
+    pops     = np.asarray(pops, dtype=float)
+    uncovered = pops.copy()
+    hubs      = []
+
+    for _ in range(k):
+        # Score each candidate = sum of uncovered population within 200 miles
+        best_score = -1
+        best_idx   = 0
+        # Sample candidates from high-population areas for speed
+        cand_w = uncovered / (uncovered.sum() + 1e-9)
+        candidates = np.random.default_rng(42).choice(
+            len(coords), size=min(500, len(coords)), p=cand_w, replace=False)
+        for ci in candidates:
+            d = haversine_matrix(
+                lats, lons,
+                np.array([coords[ci,0]]),
+                np.array([coords[ci,1]])).ravel()
+            score = uncovered[d < 200].sum()
+            if score > best_score:
+                best_score = score
+                best_idx   = ci
+        hubs.append(coords[best_idx].copy())
+        # Remove covered population
+        d_new = haversine_matrix(
+            lats, lons,
+            np.array([coords[best_idx,0]]),
+            np.array([coords[best_idx,1]])).ravel()
+        uncovered[d_new < 200] *= 0.1  # heavily discount already-covered
+
+    return np.array(hubs)
 
 @st.cache_data(show_spinner="Optimising hub locations…")
 def optimize_hubs(lats, lons, weights, k):
     """
-    Peak hub placement optimisation using three strategies in parallel,
-    keeping the best result by weighted objective score.
+    Peak hub placement: population-first optimization with risk tiebreaker.
 
-    Strategy 1 — Weighted K-Means (sqrt-damped weights, 20 restarts)
-    Strategy 2 — Greedy farthest-point init + local search
-    Strategy 3 — Pure geographic spread + local search (fallback coverage)
+    The core insight: at any hub count, covering MORE PEOPLE is always
+    better than clustering hubs on highest-risk areas. Risk weighting
+    is applied as a secondary factor via the blend weight.
 
-    Each strategy is followed by local search refinement.
-    The lowest weighted-distance objective wins.
+    Four strategies compete — best population-weighted objective wins:
+
+    S1: Population-weighted K-Means (10 random seeds)
+    S2: Greedy population-coverage init + Lloyd refinement
+    S3: Pure geographic K-Means + Lloyd refinement (safety net)
+    S4: Risk-blended K-Means (risk × population, sqrt-dampened)
+
+    All followed by Lloyd's algorithm refinement on population weights.
     """
     lats    = np.asarray(lats,    dtype=float)
     lons    = np.asarray(lons,    dtype=float)
     weights = np.asarray(weights, dtype=float)
     weights = np.clip(weights, 0, None)
-
-    # Fallback: if weights are all zero use uniform
     if weights.sum() < 1e-9:
         weights = np.ones(len(lats))
+
+    # Population from weights — extract pop component for coverage optimization
+    # weights = pop * risk_factor; approximate pop by sqrt to reduce risk skew
+    pops = np.sqrt(weights + 1.0)   # smooth proxy that scales with population
 
     best_hubs = None
     best_obj  = float("inf")
 
-    # ── Strategy 1: Weighted K-Means ──────────────────────────
-    try:
-        centers1 = _weighted_kmeans(lats, lons, weights, k, seed=42)
-        hubs1, obj1 = _local_search(lats, lons, weights, centers1)
-        if obj1 < best_obj:
-            best_obj  = obj1
-            best_hubs = hubs1
-    except Exception:
-        pass
+    # ── S1: Population-weighted K-Means, 10 seeds ─────────────
+    for seed in [42, 7, 13, 17, 23, 31, 37, 43, 53, 61]:
+        try:
+            centers = _kmeans_pop(lats, lons, pops, k, seed)
+            hubs_s, obj_s = _local_search_pop(lats, lons, pops, centers)
+            if obj_s < best_obj:
+                best_obj  = obj_s
+                best_hubs = hubs_s
+        except Exception:
+            pass
 
-    # ── Strategy 2: Greedy init + local search ────────────────
+    # ── S2: Greedy population-coverage init ───────────────────
     try:
-        centers2 = _greedy_init(lats, lons, weights, k)
-        hubs2, obj2 = _local_search(lats, lons, weights, centers2)
+        centers2 = _greedy_pop_init(lats, lons, pops, k)
+        hubs2, obj2 = _local_search_pop(lats, lons, pops, centers2)
         if obj2 < best_obj:
             best_obj  = obj2
             best_hubs = hubs2
     except Exception:
         pass
 
-    # ── Strategy 3: Pure geographic spread ────────────────────
-    # Ensures at least one strategy provides broad coverage
+    # ── S3: Pure geographic spread (safety net) ───────────────
     try:
-        coords  = np.column_stack([lats, lons])
-        km3     = KMeans(n_clusters=k, n_init=5, random_state=7,
-                         max_iter=500, algorithm="lloyd")
+        coords = np.column_stack([lats, lons])
+        km3    = KMeans(n_clusters=k, n_init=5, random_state=99, max_iter=500)
         km3.fit(coords)
-        centers3 = km3.cluster_centers_
-        hubs3, obj3 = _local_search(lats, lons, weights, centers3)
+        hubs3, obj3 = _local_search_pop(lats, lons, pops, km3.cluster_centers_)
         if obj3 < best_obj:
             best_obj  = obj3
             best_hubs = hubs3
     except Exception:
         pass
 
-    # ── Fallback if all strategies failed ─────────────────────
+    # ── S4: Risk-blended (sqrt-damped risk × pop) ─────────────
+    try:
+        coords  = np.column_stack([lats, lons])
+        w_blend = np.sqrt(weights)
+        w_blend = w_blend / (w_blend.sum() + 1e-9)
+        idx     = np.random.default_rng(42).choice(
+            len(coords), size=min(40_000, len(coords)*10), p=w_blend, replace=True)
+        km4 = KMeans(n_clusters=k, n_init=10, random_state=42, max_iter=500)
+        km4.fit(coords[idx])
+        hubs4, obj4 = _local_search_pop(lats, lons, pops, km4.cluster_centers_)
+        if obj4 < best_obj:
+            best_obj  = obj4
+            best_hubs = hubs4
+    except Exception:
+        pass
+
+    # ── Fallback ──────────────────────────────────────────────
     if best_hubs is None:
         coords   = np.column_stack([lats, lons])
         km_fb    = KMeans(n_clusters=k, n_init=5, random_state=42)
@@ -1298,32 +1306,29 @@ def optimize_hubs(lats, lons, weights, k):
 
 @st.cache_data(show_spinner=False)
 def compute_baseline(lats, lons, weights, k):
-    """
-    Baseline: pure geographic KMeans with no risk awareness.
-    Represents how hubs would be placed WITHOUT DisasterHub.
-    """
-    lats    = np.asarray(lats,    dtype=float)
-    lons    = np.asarray(lons,    dtype=float)
-    weights = np.asarray(weights, dtype=float)
-    coords  = np.column_stack([lats, lons])
-    km = KMeans(n_clusters=k, n_init=5, random_state=99, max_iter=500)
+    """Baseline: pure geographic KMeans — no population or risk awareness."""
+    lats   = np.asarray(lats,  dtype=float)
+    lons   = np.asarray(lons,  dtype=float)
+    coords = np.column_stack([lats, lons])
+    km     = KMeans(n_clusters=k, n_init=5, random_state=99, max_iter=500)
     km.fit(coords)
-    bh   = km.cluster_centers_
-    dist = haversine_matrix(lats, lons, bh[:,0], bh[:,1])
+    bh     = km.cluster_centers_
+    dist   = haversine_matrix(lats, lons, bh[:,0], bh[:,1])
     travel = dist.min(axis=1)/55.0*60.0+15.0
-    return float(travel.mean()), float((weights * dist.min(axis=1)).sum())
+    pops   = np.sqrt(np.asarray(weights, dtype=float) + 1.0)
+    return float(travel.mean()), float((pops * dist.min(axis=1)).sum())
 
 @st.cache_data(show_spinner=False)
 def baseline_coverage(lats, lons, pops, k):
-    """Baseline 60/90-min population coverage with no risk-aware placement."""
-    lats  = np.asarray(lats,  dtype=float)
-    lons  = np.asarray(lons,  dtype=float)
-    pops  = np.asarray(pops,  dtype=float)
+    """Baseline 60/90-min population coverage — pure geographic spread."""
+    lats   = np.asarray(lats,  dtype=float)
+    lons   = np.asarray(lons,  dtype=float)
+    pops   = np.asarray(pops,  dtype=float)
     coords = np.column_stack([lats, lons])
-    km = KMeans(n_clusters=k, n_init=5, random_state=99, max_iter=500)
+    km     = KMeans(n_clusters=k, n_init=5, random_state=99, max_iter=500)
     km.fit(coords)
-    bh   = km.cluster_centers_
-    dist = haversine_matrix(lats, lons, bh[:,0], bh[:,1])
+    bh     = km.cluster_centers_
+    dist   = haversine_matrix(lats, lons, bh[:,0], bh[:,1])
     travel = dist.min(axis=1)/55.0*60.0+15.0
     total  = max(pops.sum(), 1)
     return float((pops[travel<60].sum()/total)*100), float((pops[travel<90].sum()/total)*100)

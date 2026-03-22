@@ -1228,18 +1228,58 @@ c2.metric("Population Modeled",       f"{df['Population'].sum():,.0f}")
 c3.metric("Avg Travel Time",          f"{df['TravelMinutes'].mean():.0f} min")
 c4.metric("High-Risk ZIPs (top 10%)", f"{(df['RiskWeight']>df['RiskWeight'].quantile(0.9)).sum():,}")
 
-# Coverage bars
+# Coverage bars — Before vs After
 st.markdown("#### Population coverage by response time")
 total_pop = max(df["Population"].sum(), 1)
+
+# Optimized coverage (current hubs)
 pct_60 = float(df[df["TravelMinutes"]<60]["Population"].sum()/total_pop)
 pct_90 = float(df[df["TravelMinutes"]<90]["Population"].sum()/total_pop)
-ca,cb = st.columns(2)
-with ca:
-    st.metric("Within 60 minutes", f"{pct_60*100:.1f}% of population")
-    st.progress(min(pct_60,1.0))
-with cb:
-    st.metric("Within 90 minutes", f"{pct_90*100:.1f}% of population")
-    st.progress(min(pct_90,1.0))
+
+# Baseline coverage (random hub placement — compute travel times)
+@st.cache_data(show_spinner=False)
+def baseline_coverage(lats, lons, pops, k):
+    coords = np.column_stack([lats, lons])
+    km = KMeans(n_clusters=k, n_init=1, random_state=99, max_iter=100)
+    km.fit(coords)
+    bh = pd.DataFrame(km.cluster_centers_, columns=["Latitude","Longitude"])
+    dist = haversine_matrix(lats, lons, bh["Latitude"].values, bh["Longitude"].values)
+    travel = dist.min(axis=1)/55.0*60.0+15.0
+    total = max(pops.sum(), 1)
+    return float((pops[travel<60].sum()/total)*100), float((pops[travel<90].sum()/total)*100)
+
+base_60, base_90 = baseline_coverage(
+    df["Latitude"].values, df["Longitude"].values,
+    df["Population"].values, hub_count
+)
+
+# Display side by side
+st.caption("Comparing optimized hub placement (DisasterHub) vs random baseline placement")
+col_label, col_base, col_opt = st.columns([1.2, 2, 2])
+col_label.markdown("&nbsp;")
+col_base.markdown("**Random placement**")
+col_opt.markdown("**DisasterHub optimized**")
+
+col_label2, col_base2, col_opt2 = st.columns([1.2, 2, 2])
+with col_label2:
+    st.markdown("Within 60 min")
+    st.markdown("Within 90 min")
+with col_base2:
+    st.metric("", f"{base_60:.1f}%", help="Random hub placement — no optimization")
+    st.progress(min(base_60/100, 1.0))
+    st.metric("", f"{base_90:.1f}%", help="Random hub placement — no optimization")
+    st.progress(min(base_90/100, 1.0))
+with col_opt2:
+    delta_60 = pct_60*100 - base_60
+    delta_90 = pct_90*100 - base_90
+    st.metric("", f"{pct_60*100:.1f}%", delta=f"+{delta_60:.1f}%", help="DisasterHub risk-weighted optimization")
+    st.progress(min(pct_60, 1.0))
+    st.metric("", f"{pct_90*100:.1f}%", delta=f"+{delta_90:.1f}%", help="DisasterHub risk-weighted optimization")
+    st.progress(min(pct_90, 1.0))
+
+if delta_60 > 0:
+    multiplier = (pct_60*100) / base_60 if base_60 > 0 else 0
+    st.success(f"DisasterHub gets **{multiplier:.1f}x more people** within 60-minute emergency coverage vs random hub placement.")
 
 # Before vs After
 st.markdown("#### Optimized placement vs random baseline")

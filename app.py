@@ -1657,10 +1657,7 @@ dist_matrix         = haversine_matrix(df["Latitude"].values, df["Longitude"].va
                                         hubs["Latitude"].values, hubs["Longitude"].values)
 df["NearestHub"]    = dist_matrix.argmin(axis=1)
 df["DistanceMiles"] = dist_matrix.min(axis=1)
-# Feature 1: Road-factor adjusted travel time (more accurate than straight haversine/55mph)
-df["TravelMinutes"] = df.apply(
-    lambda r: road_adjusted_time(r["DistanceMiles"], r.get("State","")), axis=1
-)
+df["TravelMinutes"] = df["DistanceMiles"] / 55.0 * 60.0 + 15.0
 
 hub_city_labels = (
     df.sort_values("Population", ascending=False)
@@ -1858,7 +1855,7 @@ if zip_lookup.strip():
         r3c1,r3c2,r3c3,r3c4 = st.columns(4)
         r3c1.metric("Nearest Hub",  f"Hub {int(lookup_result['NearestHub'])}")
         r3c2.metric("Distance",     f"{lookup_result['DistanceMiles']:.1f} mi")
-        r3c3.metric("Travel Time",  f"{lookup_result['TravelMinutes']:.0f} min (road-adjusted)")
+        r3c3.metric("Travel Time",  f"{lookup_result['TravelMinutes']:.0f} min")
         r3c4.metric("Winter Risk",  f"{lookup_result['WinterRisk']:.2f}")
 
         # Feature 2: ML predicted risk

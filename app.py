@@ -1882,6 +1882,92 @@ d_icon = DISASTER_TYPES[disaster_choice]["icon"]
 st.title("DisasterHub — Getting emergency help to every community faster")
 st.caption(f"Now optimizing: {d_icon} {disaster_choice}  ·  7 disaster types  ·  FEMA + Census + NOAA data")
 
+# ── Disaster type explainer ───────────────────────────────────
+_DISASTER_EXPLAINER = {
+    "All Disasters": {
+        "color": "blue",
+        "what": "Hubs are placed to minimize response time across **all 7 disaster types simultaneously**, weighted by each ZIP's combined FEMA risk score and population.",
+        "how": "RiskWeight = Population × (Flood + Hurricane + Tornado + Wildfire + Earthquake + Winter + Coastal) / 7 × (1 + historical damage). Every disaster type contributes equally unless you adjust the severity sliders.",
+        "hotspots": "Gulf Coast (flood/hurricane), Tornado Alley OK/KS/TX, California (wildfire/earthquake), Northern tier (winter storms).",
+        "use_case": "Best for general national emergency planning — balances all hazards.",
+    },
+    "Flood": {
+        "color": "blue",
+        "what": "Hubs shift toward **flood-prone river basins and coastal lowlands**. Mississippi River valley, Gulf Coast, and Atlantic coastal plain ZIPs are weighted highest.",
+        "how": "RiskWeight = Population × FloodRisk (FEMA NRI) × damage multiplier. Only flood risk drives hub placement — hurricane and coastal risks are excluded.",
+        "hotspots": "Louisiana (highest), Mississippi River corridor (MO/IL/TN), Texas Gulf Coast, Florida interior, North Carolina river basins.",
+        "use_case": "Use when planning pre-positioning for a hurricane flood event or spring river flooding.",
+    },
+    "Hurricane": {
+        "color": "blue",
+        "what": "Hubs concentrate along the **Atlantic and Gulf coastlines** — the primary hurricane strike zones. Florida, Louisiana, Texas, and the Carolinas are heavily weighted.",
+        "how": "RiskWeight = Population × avg(HurricaneRisk, CoastalRisk) × damage multiplier. Both wind and storm surge risk are combined.",
+        "hotspots": "South Florida (highest), Louisiana coast, Texas Gulf Coast, Outer Banks NC, South Carolina coast.",
+        "use_case": "Use during Atlantic hurricane season (June–November) for pre-storm hub staging.",
+    },
+    "Tornado / Storms": {
+        "color": "blue",
+        "what": "Hubs shift into **Tornado Alley** (TX/OK/KS/NE) and **Dixie Alley** (MS/AL/TN) — the two primary tornado corridors in the US.",
+        "how": "RiskWeight = Population × TornadoRisk (FEMA NRI). Oklahoma and Kansas ZIPs are weighted 3–4x the national average.",
+        "hotspots": "Oklahoma City & Tulsa corridors (highest), central Kansas, north Texas, Mississippi/Alabama tornado belt.",
+        "use_case": "Use during spring severe weather season (March–June) for tornado outbreak response planning.",
+    },
+    "Wildfire": {
+        "color": "blue",
+        "what": "Hubs shift to the **Western US** — California, Oregon, Washington, Colorado, and the Southwest, where wildfire risk is highest according to FEMA NRI.",
+        "how": "RiskWeight = Population × WildfireRisk (FEMA NRI) × damage multiplier. California ZIPs dominate due to high population + high risk.",
+        "hotspots": "Northern California (highest), Southern California, Oregon Cascades, Colorado Front Range, New Mexico.",
+        "use_case": "Use during fire season (May–October) or to plan hub coverage for wildland-urban interface communities.",
+    },
+    "Earthquake": {
+        "color": "blue",
+        "what": "Hubs concentrate along the **West Coast** (San Andreas + Cascadia fault zones) and the **New Madrid Seismic Zone** (MO/AR/TN/KY) — the two highest earthquake risk regions in the US.",
+        "how": "RiskWeight = Population × EarthquakeRisk (FEMA NRI). Seattle, Portland, and San Francisco ZIPs are weighted highest due to Cascadia and San Andreas exposure.",
+        "hotspots": "San Francisco Bay Area (highest), Pacific Northwest (Cascadia subduction zone), Los Angeles basin, New Madrid zone (Memphis/St. Louis).",
+        "use_case": "Use for earthquake preparedness planning — hubs outside the rupture zone are critical since roads near the epicenter will be impassable.",
+    },
+    "Winter Storm": {
+        "color": "blue",
+        "what": "Hubs shift to the **Northern tier states**, Great Plains, and Appalachians — where winter storm risk is highest. Southern states with low winter preparedness (TX, LA) are also flagged.",
+        "how": "RiskWeight = Population × WinterRisk (FEMA NRI). Minnesota, North Dakota, and Wisconsin ZIPs are weighted highest.",
+        "hotspots": "Upper Midwest (MN/ND/WI highest), Great Plains blizzard corridor, Appalachian Mountains, Texas (high vulnerability despite low frequency).",
+        "use_case": "Use for winter storm pre-positioning — especially relevant after 2021 Texas freeze showed how unprepared warm-weather states can be.",
+    },
+}
+
+if disaster_choice in _DISASTER_EXPLAINER:
+    ex = _DISASTER_EXPLAINER[disaster_choice]
+    # Compute actual top states for this disaster to make it data-driven
+    d_fields = DISASTER_TYPES[disaster_choice]["fields"]
+    if d_fields and all(f in df.columns for f in d_fields):
+        df_risk = df.copy()
+        df_risk["_dr"] = df_risk[d_fields].mean(axis=1)
+        top_states = (df_risk.groupby("State")["_dr"].mean()
+                      .sort_values(ascending=False).head(5))
+        top_str = ", ".join([f"**{s}** ({v:.2f})" for s,v in top_states.items()])
+        avg_risk  = df_risk["_dr"].mean()
+        max_risk  = df_risk["_dr"].max()
+        top_zip   = df_risk.loc[df_risk["_dr"].idxmax()]
+        top_city  = f"{top_zip.get('City','')}, {top_zip.get('State','')}"
+    else:
+        top_str  = "Loading..."
+        avg_risk = max_risk = 0
+        top_city = ""
+
+    with st.expander(f"{d_icon} What does **{disaster_choice}** mode do? — click to learn", expanded=(disaster_choice != "All Disasters")):
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.markdown(f"**What changes when you select this mode:**")
+            st.markdown(ex["what"])
+            st.markdown(f"**How hub placement is calculated:**")
+            st.markdown(ex["how"])
+        with col_r:
+            st.markdown(f"**Highest-risk states (FEMA NRI):**")
+            st.markdown(top_str if top_str != "Loading..." else ex["hotspots"])
+            st.markdown(f"**Highest-risk community:** {top_city} (risk score: {max_risk:.3f})")
+            st.markdown(f"**National avg {disaster_choice} risk:** {avg_risk:.3f}")
+            st.info(f"💡 **Best use case:** {ex['use_case']}")
+
 risk_cols_check = ["FloodRisk","TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
 has_risk = all(c in df.columns for c in risk_cols_check) and df["FloodRisk"].max() > 0
 has_pop  = "Population" in df.columns and df["Population"].sum() > 1e8

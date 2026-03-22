@@ -711,7 +711,9 @@ def build_official_dataset():
 
     # Final cleanup
     df["ZIP"]        = df["ZIP"].astype(str).str.zfill(5)
-    df["Population"] = pd.to_numeric(df["Population"], errors="coerce").fillna(0).clip(lower=0).astype(int)
+    # Deduplicate ZIPs — Census crosswalk can create duplicates
+    df = df.sort_values("Population", ascending=False).drop_duplicates(subset=["ZIP"], keep="first")
+    df["Population"] = pd.to_numeric(df["Population"], errors="coerce").fillna(0).clip(0, 120_000).astype(int)
     risk_cols_all = ["FloodRisk","HurricaneRisk","CoastalRisk","TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
     for col in risk_cols_all:
         if col not in df.columns: df[col] = 0.0
@@ -875,6 +877,10 @@ def _normalize(df):
     if "Population" not in df.columns: df["Population"] = 5000  # default for missing pop
     df["ZIP"]        = df["ZIP"].astype(str).str.strip().str.zfill(5)
     df["Population"] = pd.to_numeric(df["Population"], errors="coerce").fillna(5000).astype(int)
+    # Cap population at realistic ZIP-level maximum (NYC densest ZIP ~100k)
+    df["Population"] = df["Population"].clip(0, 120_000)
+    # CRITICAL: deduplicate by ZIP — keeps highest population row
+    df = df.sort_values("Population", ascending=False).drop_duplicates(subset=["ZIP"], keep="first")
     df = _fill_names_from_prefix(df)
     return df.reset_index(drop=True)
 
@@ -1482,15 +1488,55 @@ def apply_fema_flood_zones(df, flood_zones):
     return df
 
 # ──────────────────────────────────────────────────────────────
+# POPULATION SANITIZER
+# ──────────────────────────────────────────────────────────────
+def _sanitize_population(df):
+    """
+    Ensure population data is realistic.
+    Real US: ~349M people (2026 projection), ~33k ZIPs, max ~120k per ZIP.
+    Deduplicates ZIPs and caps unrealistic values.
+    """
+    df = df.copy()
+    df["Population"] = pd.to_numeric(df["Population"], errors="coerce").fillna(0)
+    # Cap at max realistic ZIP population (densest NYC ZIP ~110k)
+    df["Population"] = df["Population"].clip(0, 120_000).astype(int)
+    # Deduplicate — keep highest population row per ZIP
+    df = df.sort_values("Population", ascending=False).drop_duplicates(
+        subset=["ZIP"], keep="first").reset_index(drop=True)
+    # If total still way too high, scale down proportionally
+    total = df["Population"].sum()
+    if total > 500_000_000:
+        scale = 349_000_000 / total
+        df["Population"] = (df["Population"] * scale).clip(0, 120_000).astype(int)
+    return df
+
+# ──────────────────────────────────────────────────────────────
 # MAIN DATA LOADER
 # ──────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Loading official government datasets…")
 def build_datasets():
+    # Sanity-check cached population data — wipe if clearly wrong
+    # Real US: ~349M people (2026 projection) across ~33k ZIPs
+    pop_cache = os.path.join(DATA_DIR, "census_pop.csv")
+    if os.path.exists(pop_cache):
+        try:
+            pc = pd.read_csv(pop_cache, dtype=str)
+            pc["Population"] = pd.to_numeric(pc["Population"], errors="coerce").fillna(0)
+            total = pc["Population"].sum()
+            n_zips = len(pc)
+            if total > 500_000_000 or total < 50_000_000 or n_zips < 20_000:
+                os.remove(pop_cache)
+                if os.path.exists(OUTPUT_CSV):
+                    os.remove(OUTPUT_CSV)
+        except Exception:
+            pass
+
     # 1. Try official pipeline (downloads FEMA + Census + NOAA)
     if not os.path.exists(OUTPUT_CSV):
         try:
             df = build_official_dataset()
             if df is not None and not df.empty:
+                df = _sanitize_population(df)
                 return df
         except Exception as e:
             st.warning(f"Official data pipeline error: {e}")
@@ -1501,12 +1547,12 @@ def build_datasets():
             raw = pd.read_csv(OUTPUT_CSV, dtype=str)
             df  = _normalize(raw)
             if len(df) > 100:
+                df = _sanitize_population(df)
                 risk_cols = ["FloodRisk","TornadoRisk","WildfireRisk","EarthquakeRisk","WinterRisk"]
                 if not all(c in df.columns for c in risk_cols):
                     df = _enrich(df)
                 if "HistoricalDamage" not in df.columns:
-                    np.random.seed(42)
-                    df["HistoricalDamage"] = 0  # NOAA unavailable
+                    df["HistoricalDamage"] = 0
                 return df
         except Exception:
             pass

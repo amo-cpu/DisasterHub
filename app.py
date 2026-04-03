@@ -1992,18 +1992,14 @@ else:
 
 with st.expander("Why I built this — the story behind DisasterHub"):
     st.markdown("""
-    When disasters strike, the communities that suffer most aren't just in the path of the event —
-    they're the ones emergency responders **can't reach in time**. I built DisasterHub because I wanted
-    to answer a question that kept bothering me: **where should emergency hubs actually be placed
-    to save the most lives — across every type of disaster?**
+**"We can't stop a natural disaster once it starts, but we can change how we help the people in its path."**
 
-    From hurricanes on the Gulf Coast, to wildfires in California, to tornadoes in Oklahoma, to
-    blizzards in the Northern Plains — the pattern is always the same. Help arrives too late.
-    The communities with the highest risk often have the least coverage.
+I built DisasterHub because too many people lose loved ones to nature. I realized that so many lives could be saved from lifelong injury—or even death—if emergency response hubs were just a bit closer. If we can reach people within that **'Golden Hour'** window, we can save lives.
 
-    DisasterHub uses FEMA risk data, US Census population data, and weighted K-Means optimization
-    to answer that question with math instead of guesswork — for all 7 major US disaster types.
-    """)
+I couldn't just sit back while climate change makes these disasters more frequent and severe. Even here in **North Carolina**, we felt it with the back-to-back snowstorms at the start of this year. 
+
+There is no better time than the present to put this data in front of officials. DisasterHub uses math and optimization to turn a 'maybe' into a certainty.
+""")
 
 # Live alerts + hub reallocation suggestions
 alerts = fetch_noaa_alerts()
